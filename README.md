@@ -25,19 +25,25 @@ No cloud. No API keys. No subscriptions. Your voice never leaves your machine.
 
 ## 📦 Installation
 
+### Prerequisites
+
+- **Python 3.10+** — [Download here](https://python.org). ⚠️ Check **"Add python.exe to PATH"** during installation!
+- **NVIDIA GPU recommended** — CUDA-capable GPU for fast transcription. CPU works but is slower.
+
 ### One-click install
 
 1. Clone or download this repository
 2. Double-click **`install.bat`**
-3. Done. Run **`start.bat`** to launch.
+3. Wait for the Whisper model to download (~1.5 GB, one-time only)
+4. Done. Run **`start.bat`** to launch.
 
-The installer will:
-- Verify Python 3.10+ is installed
-- Create a virtual environment
-- Install PyTorch with CUDA support (falls back to CPU if no NVIDIA GPU)
-- Install all dependencies
-- Create config at `%USERPROFILE%\.whispertype\config.json`
-- Add a Windows Startup shortcut
+The installer handles everything automatically:
+- Creates a Python virtual environment
+- Installs PyTorch with CUDA support (falls back to CPU if no NVIDIA GPU)
+- Installs all dependencies
+- Downloads the Whisper speech recognition model (~1.5 GB)
+- Creates config at `%USERPROFILE%\.whispertype\config.json`
+- Adds a Windows Startup shortcut (auto-starts with Windows)
 
 ### Manual install
 
@@ -45,6 +51,7 @@ The installer will:
 python -m venv .venv
 .venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu124
 .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -c "import whisper; whisper.load_model('large-v3-turbo', device='cpu')"
 mkdir %USERPROFILE%\.whispertype
 copy config.template.json %USERPROFILE%\.whispertype\config.json
 ```
@@ -99,7 +106,6 @@ A single **PyAudio** instance is created at startup and reused for all recording
 | **No ffmpeg subprocess** | Whisper's `load_audio()` shells out to ffmpeg, which flashes a CMD window on Windows. We bypass it entirely by feeding raw PCM → numpy → mel spectrogram. |
 | **Single PyAudio instance** | Creating/destroying PyAudio per recording causes a brief console flash on Windows. One instance lives for the entire daemon lifetime. |
 | **GPU auto-detection** | Uses CUDA if available, gracefully falls back to CPU. No config needed. |
-| **Alpha-based overlay visibility** | Instead of `withdraw()`/`deiconify()` (which flash on Windows), the overlay uses `alpha=0` + off-screen positioning for truly invisible hiding. |
 | **Double-tap activation** | Prevents accidental triggers — a single keypress does nothing. Only a quick double-tap within 400ms starts recording. |
 
 ## 💻 Requirements

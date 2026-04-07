@@ -12,7 +12,11 @@ echo.
 where python >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python not found in PATH.
+    echo.
     echo Please install Python 3.10+ from https://python.org
+    echo IMPORTANT: Check "Add python.exe to PATH" during installation!
+    echo.
+    echo After installing Python, run this installer again.
     pause
     exit /b 1
 )
@@ -79,6 +83,19 @@ if errorlevel 1 (
 )
 
 echo [OK] All dependencies installed.
+echo.
+
+:: ── Pre-download Whisper model ─────────────────────────────────────────────
+
+echo Downloading Whisper model (large-v3-turbo)...
+echo This is ~1.5 GB and only needs to happen once.
+echo.
+"%VENV%\Scripts\python.exe" -c "import whisper; whisper.load_model('large-v3-turbo', device='cpu')"
+if errorlevel 1 (
+    echo [WARN] Model download failed. It will be downloaded on first launch instead.
+) else (
+    echo [OK] Whisper model downloaded and cached.
+)
 echo.
 
 :: ── Copy config ─────────────────────────────────────────────────────────────

@@ -82,7 +82,7 @@ def make_tray_icon(state="idle"):
     return img
 
 
-# ── Overlay (NO withdraw/deiconify — alpha-only visibility) ──────────────────
+# ── Overlay ─────────────────────────────────────────────────────────────────
 
 OFF_SCREEN = "-9999+-9999"
 
