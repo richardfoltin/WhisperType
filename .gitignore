@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+voice_daemon.log
+*.egg-info/
+dist/
+build/
