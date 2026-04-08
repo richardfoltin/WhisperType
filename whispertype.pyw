@@ -582,12 +582,12 @@ def load_model(name):
     return m
 
 def transcribe(audio_bytes):
+    # Convert raw PCM to float32 numpy — bypasses whisper.load_audio() / ffmpeg
     audio_np = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0
-    audio_padded = whisper.pad_or_trim(audio_np)
-    mel = whisper.log_mel_spectrogram(audio_padded, n_mels=128).to(DEVICE)
-    options = whisper.DecodingOptions(language=LANGUAGE, fp16=(DEVICE == "cuda"))
-    result = whisper.decode(wmodel[0], mel, options)
-    return result.text.strip()
+    # Use whisper.transcribe() with numpy array (no ffmpeg, handles any length)
+    result = whisper.transcribe(wmodel[0], audio_np, language=LANGUAGE,
+                                fp16=(DEVICE == "cuda"))
+    return result["text"].strip()
 
 
 # ── Auto-type via Win32 SendInput ────────────────────────────────────────────
