@@ -5,3 +5,4 @@ pynput>=1.7.6
 pystray>=0.19
 Pillow>=10.0
 numpy>=1.21
+nvidia-ml-py>=12.0
