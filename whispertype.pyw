@@ -249,9 +249,14 @@ class RecordingOverlay:
                               font=("Consolas", 11))
         self.timer.pack(side="right")
 
-        self.model_lbl = tk.Label(self.rec_frame, text="", bg=self.C["bg"],
+        info_row = tk.Frame(self.rec_frame, bg=self.C["bg"])
+        info_row.pack(fill="x", padx=14)
+        self.model_lbl = tk.Label(info_row, text="", bg=self.C["bg"],
                                   fg=self.C["dim"], font=("Segoe UI", 8))
-        self.model_lbl.pack(anchor="w", padx=14)
+        self.model_lbl.pack(side="left")
+        self.target_lbl = tk.Label(info_row, text="", bg=self.C["bg"],
+                                   fg=self.C["dim"], font=("Segoe UI", 8))
+        self.target_lbl.pack(side="right")
 
         self.level_cv = tk.Canvas(self.rec_frame, bg=self.C["bg"], width=cw,
                                   height=24, highlightthickness=0)
@@ -429,11 +434,12 @@ class RecordingOverlay:
 
     # ── Public methods ──
 
-    def show_recording(self):
+    def show_recording(self, target_name=""):
         self._recording = True
         self._history_mode = False
         self._t0 = time.time()
         self.model_lbl.config(text=f"Model: {current_model_name[0]}")
+        self.target_lbl.config(text=f"\u2192 {target_name}" if target_name else "")
         self._draw_level(0)
         self._show_overlay()
         self._tick()
@@ -442,6 +448,7 @@ class RecordingOverlay:
     def _show_rec_idle(self):
         self._cancel_timer_blink()
         self.model_lbl.config(text=f"Model: {current_model_name[0]}")
+        self.target_lbl.config(text="")
         self._draw_level(0)
 
     def on_recording_stopped(self):
@@ -865,7 +872,24 @@ def get_foreground_window():
     return ctypes.windll.user32.GetForegroundWindow()
 
 def set_foreground_window(hwnd):
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    # Windows blocks SetForegroundWindow from background processes.
+    # Simulate an Alt press to bypass the restriction, then restore the window.
+    user32 = ctypes.windll.user32
+    SW_RESTORE = 9
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    # Press and release Alt to allow SetForegroundWindow
+    alt_inp = INPUT()
+    alt_inp.type = INPUT_KEYBOARD
+    alt_inp.ki.wVk = 0x12  # VK_MENU (Alt)
+    alt_inp.ki.dwFlags = 0
+    alt_up = INPUT()
+    alt_up.type = INPUT_KEYBOARD
+    alt_up.ki.wVk = 0x12
+    alt_up.ki.dwFlags = KEYEVENTF_KEYUP
+    arr = (INPUT * 2)(alt_inp, alt_up)
+    user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+    user32.SetForegroundWindow(hwnd)
 
 def get_window_text(hwnd):
     buf = ctypes.create_unicode_buffer(256)
@@ -987,6 +1011,8 @@ discard_recording = [False]
 stop_event       = [threading.Event()]
 last_tap       = [0.0]
 enter_stop     = [False]   # True when recording was stopped via Enter key
+target_hwnd_pre  = [None]   # HWND captured before overlay steals focus
+target_wname_pre = [""]     # window title captured before recording
 overlay        = None
 
 
@@ -1026,9 +1052,13 @@ def on_press(key):
             recording[0] = True
             discard_recording[0] = False
             stop_event[0] = threading.Event()
-            overlay.root.after(0, overlay.show_recording)
+            # Capture target window BEFORE overlay steals focus
+            target_hwnd_pre[0] = get_foreground_window()
+            target_wname_pre[0] = get_window_text(target_hwnd_pre[0])
+            wname = target_wname_pre[0]
+            overlay.root.after(0, lambda: overlay.show_recording(wname))
             threading.Thread(target=_record_and_enqueue, daemon=True).start()
-            log("Recording started (double-tap)")
+            log(f"Recording started (double-tap), target: {wname}")
         last_tap[0] = now
 
 
@@ -1039,8 +1069,8 @@ def on_release(key):
 def _record_and_enqueue():
     try:
         audio = record_until_stop(stop_event[0], level_callback=overlay.push_level)
-        target_hwnd = get_foreground_window()
-        window_name = get_window_text(target_hwnd)
+        target_hwnd = target_hwnd_pre[0]
+        window_name = target_wname_pre[0]
         recording[0] = False
 
         if not audio or discard_recording[0]:
