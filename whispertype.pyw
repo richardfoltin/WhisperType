@@ -871,6 +871,20 @@ _extra = ctypes.pointer(ctypes.c_ulong(0))
 def get_foreground_window():
     return ctypes.windll.user32.GetForegroundWindow()
 
+def get_real_target_window():
+    """Get the foreground window, skipping our own overlay."""
+    hwnd = get_foreground_window()
+    if overlay and hwnd == overlay.root.winfo_id():
+        # Overlay is focused (e.g. history mode) — get next window in Z-order
+        GW_HWNDNEXT = 2
+        candidate = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
+        while candidate:
+            if (ctypes.windll.user32.IsWindowVisible(candidate)
+                    and ctypes.windll.user32.GetWindowTextLengthW(candidate) > 0):
+                return candidate
+            candidate = ctypes.windll.user32.GetWindow(candidate, GW_HWNDNEXT)
+    return hwnd
+
 def set_foreground_window(hwnd):
     # Windows blocks SetForegroundWindow from background processes.
     # Simulate an Alt press to bypass the restriction, then restore the window.
@@ -1052,8 +1066,8 @@ def on_press(key):
             recording[0] = True
             discard_recording[0] = False
             stop_event[0] = threading.Event()
-            # Capture target window BEFORE overlay steals focus
-            target_hwnd_pre[0] = get_foreground_window()
+            # Capture target window, skipping overlay if it has focus (e.g. history mode)
+            target_hwnd_pre[0] = get_real_target_window()
             target_wname_pre[0] = get_window_text(target_hwnd_pre[0])
             wname = target_wname_pre[0]
             overlay.root.after(0, lambda: overlay.show_recording(wname))
