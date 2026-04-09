@@ -874,25 +874,30 @@ def get_foreground_window():
 def get_real_target_window():
     """Get the foreground window, skipping our own overlay."""
     hwnd = get_foreground_window()
+    user32 = ctypes.windll.user32
     if overlay and hwnd == overlay.root.winfo_id():
         # Overlay is focused (e.g. history mode) — get next window in Z-order
         GW_HWNDNEXT = 2
-        candidate = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
+        candidate = user32.GetWindow(hwnd, GW_HWNDNEXT)
         while candidate:
-            if (ctypes.windll.user32.IsWindowVisible(candidate)
-                    and ctypes.windll.user32.GetWindowTextLengthW(candidate) > 0):
+            # Skip child windows, invisible windows, and windows without titles
+            if (user32.GetParent(candidate) == 0
+                    and user32.IsWindowVisible(candidate)
+                    and user32.GetWindowTextLengthW(candidate) > 0):
                 return candidate
-            candidate = ctypes.windll.user32.GetWindow(candidate, GW_HWNDNEXT)
+            candidate = user32.GetWindow(candidate, GW_HWNDNEXT)
     return hwnd
 
 def set_foreground_window(hwnd):
-    # Windows blocks SetForegroundWindow from background processes.
-    # Simulate an Alt press to bypass the restriction, then restore the window.
+    """Activate target window with retry. Returns True if the window is foreground."""
     user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        log(f"set_foreground_window: HWND {hwnd} is no longer valid")
+        return False
     SW_RESTORE = 9
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
-    # Press and release Alt to allow SetForegroundWindow
+    # Press and release Alt to allow SetForegroundWindow from background
     alt_inp = INPUT()
     alt_inp.type = INPUT_KEYBOARD
     alt_inp.ki.wVk = 0x12  # VK_MENU (Alt)
@@ -903,7 +908,19 @@ def set_foreground_window(hwnd):
     alt_up.ki.dwFlags = KEYEVENTF_KEYUP
     arr = (INPUT * 2)(alt_inp, alt_up)
     user32.SendInput(2, arr, ctypes.sizeof(INPUT))
-    user32.SetForegroundWindow(hwnd)
+    # Try SetForegroundWindow, then poll to confirm it worked
+    for attempt in range(2):
+        user32.SetForegroundWindow(hwnd)
+        for _ in range(10):  # poll up to ~500ms
+            time.sleep(0.05)
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+        # Second attempt: try BringWindowToTop as fallback
+        if attempt == 0:
+            user32.BringWindowToTop(hwnd)
+            log(f"set_foreground_window: retry with BringWindowToTop for HWND {hwnd}")
+    log(f"set_foreground_window: FAILED to activate HWND {hwnd} after retries")
+    return False
 
 def get_window_text(hwnd):
     buf = ctypes.create_unicode_buffer(256)
@@ -932,10 +949,14 @@ def get_process_name(hwnd):
 def auto_type(text, target_hwnd=None):
     if target_hwnd:
         try:
-            set_foreground_window(target_hwnd)
+            activated = set_foreground_window(target_hwnd)
         except Exception:
-            pass
-    time.sleep(0.2)
+            activated = False
+        if not activated:
+            log(f"auto_type: skipped — could not activate target window (text in history)")
+            return
+    else:
+        time.sleep(0.2)
     events = []
     for ch in text:
         code = ord(ch)
