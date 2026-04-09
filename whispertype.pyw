@@ -380,22 +380,22 @@ class RecordingOverlay:
         if self._recording:
             self.dot.config(fg=self.C["rec"])
             self.state_lbl.config(text="Recording", fg=self.C["text"])
-            self.hint.config(text="Transcribe: R-Ctrl / Enter\u21b5 / 3s silence  |  History: Space  |  Quit: Esc")
+            self.hint.config(text="Transcribe: R-Ctrl / Enter\u21b5 / 3s silence  |  History: Space  |  Hide: Esc")
         elif self._history_mode:
             self.dot.config(fg=self.C["bar_lo"])
             self.state_lbl.config(text="History", fg=self.C["bar_lo"])
             self.timer.config(text="")
-            self.hint.config(text="Record: Space  |  Quit: Esc")
+            self.hint.config(text="Record: Space  |  Hide: Esc")
         elif self._has_jobs():
             self.dot.config(fg=self.C["trans"])
             self.state_lbl.config(text="Transcribing", fg=self.C["trans"])
             self.timer.config(text="")
-            self.hint.config(text="Record: Double R-Ctrl  |  History: Space  |  Quit: Esc")
+            self.hint.config(text="Record: Double R-Ctrl  |  History: Space  |  Hide: Esc")
         else:
             self.dot.config(fg=self.C["dim"])
             self.state_lbl.config(text="Ready", fg=self.C["dim"])
             self.timer.config(text="")
-            self.hint.config(text="Record: Double R-Ctrl  |  History: Space  |  Quit: Esc")
+            self.hint.config(text="Record: Double R-Ctrl  |  History: Space  |  Hide: Esc")
 
     def _calc_height(self):
         h = 20  # title bar
@@ -996,9 +996,13 @@ def on_press(key):
         overlay.root.after(0, overlay.toggle_history)
         return
 
-    # Escape: quit — stop recording, hide overlay, let transcriptions finish (saved but not typed)
+    # Escape: minimize to tray — stop recording, hide overlay
     if key == pynput.keyboard.Key.esc and overlay and overlay._visible:
-        overlay.root.after(0, _do_exit)
+        if recording[0]:
+            recording[0] = False
+            discard_recording[0] = True
+            stop_event[0].set()
+        overlay.root.after(0, overlay.hide)
         return
 
     # Enter key: stop recording + flag to send Enter after transcription
