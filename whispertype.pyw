@@ -211,7 +211,7 @@ class RecordingOverlay:
         exit_btn = tk.Label(self.title_bar, text="\u00d7", bg=self.C["bg"],
                             fg=self.C["dim"], font=("Segoe UI", 11), cursor="hand2")
         exit_btn.pack(side="right")
-        exit_btn.bind("<Button-1>", lambda e: _do_exit())
+        exit_btn.bind("<Button-1>", lambda e: self.hide())
         # Drag on title bar
         self.title_bar.bind("<Button-1>", lambda e: setattr(self, '_d', (e.x, e.y)))
         self.title_bar.bind("<B1-Motion>", self._drag)
