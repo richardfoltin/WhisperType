@@ -142,16 +142,19 @@ class TranscriptionJob:
     audio_duration: float = 0.0
     status: JobStatus = JobStatus.WAITING
     created_at: float = field(default_factory=time.time)
+    send_enter: bool = False
 
 transcription_queue = queue.Queue()
 active_jobs = []
 jobs_lock = threading.Lock()
 job_counter = [0]
 
-# History: last 10 completed transcriptions
+# History: last 50 completed transcriptions
 transcription_history = []   # list of dicts: {ts, dur, app, window, text}
 history_lock = threading.Lock()
-MAX_HISTORY = 10
+MAX_HISTORY = 50
+VISIBLE_HISTORY = 8   # max visible rows before scrollbar appears
+HISTORY_ITEM_H = 22   # pixels per history row
 
 
 # ── Tray icon ────────────────────────────────────────────────────────────────
@@ -292,8 +295,34 @@ class RecordingOverlay:
                      font=_qf, width=w, anchor="w").grid(row=0, column=i, sticky="w")
         tk.Label(history_hdr_row, text="WINDOW", bg=self.C["bg"], fg=self.C["dim"],
                  font=_qf, anchor="w").grid(row=0, column=3, sticky="we")
-        self.history_items_frame = tk.Frame(self.history_frame, bg=self.C["bg"])
-        self.history_items_frame.pack(fill="x", padx=14, pady=(0, 6))
+        # Scrollable history container (Canvas + Scrollbar)
+        history_scroll_container = tk.Frame(self.history_frame, bg=self.C["bg"])
+        history_scroll_container.pack(fill="x", padx=14, pady=(0, 6))
+        self._history_canvas = tk.Canvas(
+            history_scroll_container, bg=self.C["bg"], highlightthickness=0,
+            height=VISIBLE_HISTORY * HISTORY_ITEM_H)
+        self._history_scrollbar = tk.Scrollbar(
+            history_scroll_container, orient="vertical",
+            command=self._history_canvas.yview)
+        self.history_items_frame = tk.Frame(self._history_canvas, bg=self.C["bg"])
+        self.history_items_frame.bind(
+            "<Configure>",
+            lambda e: self._history_canvas.configure(
+                scrollregion=self._history_canvas.bbox("all")))
+        self._history_canvas_win = self._history_canvas.create_window(
+            (0, 0), window=self.history_items_frame, anchor="nw")
+        self._history_canvas.configure(yscrollcommand=self._history_scrollbar.set)
+        self._history_canvas.pack(side="left", fill="x", expand=True)
+        # Scrollbar packed/forgotten dynamically in _rebuild_history
+        # Keep inner frame width in sync with canvas
+        self._history_canvas.bind("<Configure>", lambda e: self._history_canvas.itemconfig(
+            self._history_canvas_win, width=e.width))
+
+        def _on_history_mousewheel(event):
+            self._history_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._on_history_mousewheel = _on_history_mousewheel
+        self._history_canvas.bind("<MouseWheel>", _on_history_mousewheel)
+
         self.history_item_widgets = []
 
         # ── Shared tooltip widget ──
@@ -351,7 +380,7 @@ class RecordingOverlay:
         if self._recording:
             self.dot.config(fg=self.C["rec"])
             self.state_lbl.config(text="Recording", fg=self.C["text"])
-            self.hint.config(text="Transcribe: R-Ctrl / 3 sec silence  |  History: Space  |  Quit: Esc")
+            self.hint.config(text="Transcribe: R-Ctrl / Enter\u21b5 / 3s silence  |  History: Space  |  Quit: Esc")
         elif self._history_mode:
             self.dot.config(fg=self.C["bar_lo"])
             self.state_lbl.config(text="History", fg=self.C["bar_lo"])
@@ -376,7 +405,8 @@ class RecordingOverlay:
         if self._history_mode:
             with history_lock:
                 n = len(transcription_history)
-            h += 34 + max(min(n, MAX_HISTORY), 1) * 22
+            visible = min(n, VISIBLE_HISTORY) if n > 0 else 1
+            h += 34 + visible * HISTORY_ITEM_H
         else:
             with jobs_lock:
                 n = len(active_jobs)
@@ -544,7 +574,10 @@ class RecordingOverlay:
             lbl = tk.Label(self.history_items_frame, text="  No transcriptions yet",
                            bg=self.C["bg"], fg=self.C["dim"], font=("Segoe UI", 8))
             lbl.pack(anchor="w")
+            lbl.bind("<MouseWheel>", self._on_history_mousewheel)
             self.history_item_widgets.append(lbl)
+            self._history_scrollbar.pack_forget()
+            self._history_canvas.configure(height=HISTORY_ITEM_H)
             return
 
         _qf = ("Consolas", 8)
@@ -576,7 +609,7 @@ class RecordingOverlay:
             copy_btn.pack(side="left", padx=(0, 6))
             copy_btn.bind("<Button-1>", lambda e, t=entry["text"]: self._copy_text(t))
             # Tooltip on hover: show text preview
-            preview = entry["text"][:80] + ("\u2026" if len(entry["text"]) > 80 else "")
+            preview = entry["text"][:500] + ("\u2026" if len(entry["text"]) > 500 else "")
             copy_btn.bind("<Enter>", lambda e, p=preview: self._show_tooltip(e, p))
             copy_btn.bind("<Leave>", lambda e: self._hide_tooltip())
 
@@ -587,6 +620,21 @@ class RecordingOverlay:
             # idx in reversed list → real index is len-1-idx
             real_idx = len(items) - 1 - idx
             del_btn.bind("<Button-1>", lambda e, ri=real_idx: self._delete_history(ri))
+
+            # Mousewheel bindings for scrollable history
+            row.bind("<MouseWheel>", self._on_history_mousewheel)
+            for child in row.winfo_children():
+                child.bind("<MouseWheel>", self._on_history_mousewheel)
+                for grandchild in child.winfo_children():
+                    grandchild.bind("<MouseWheel>", self._on_history_mousewheel)
+
+        # Show/hide scrollbar based on item count
+        if len(items) > VISIBLE_HISTORY:
+            self._history_scrollbar.pack(side="right", fill="y")
+            self._history_canvas.configure(height=VISIBLE_HISTORY * HISTORY_ITEM_H)
+        else:
+            self._history_scrollbar.pack_forget()
+            self._history_canvas.configure(height=len(items) * HISTORY_ITEM_H)
 
     def _copy_text(self, text):
         self.root.clipboard_clear()
@@ -603,7 +651,6 @@ class RecordingOverlay:
     def _show_tooltip(self, event, text):
         self._hide_tooltip()
         x = event.widget.winfo_rootx()
-        y = event.widget.winfo_rooty() - 34
         self._tooltip = tw = tk.Toplevel(self.root)
         tw.overrideredirect(True)
         tw.attributes("-topmost", True)
@@ -614,10 +661,22 @@ class RecordingOverlay:
         lbl.pack()
         tw.update_idletasks()
         tw_w = tw.winfo_reqwidth()
-        # Keep tooltip on screen
+        tw_h = tw.winfo_reqheight()
         sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        # Try to position above the widget
+        widget_y = event.widget.winfo_rooty()
+        y = widget_y - tw_h - 4
+        if y < 0:
+            # Falls off top — position below the widget instead
+            y = widget_y + event.widget.winfo_height() + 4
+        if y + tw_h > sh:
+            y = sh - tw_h - 4
+        # Horizontal clamping
         if x + tw_w > sw:
             x = sw - tw_w - 4
+        if x < 0:
+            x = 4
         tw.geometry(f"+{x}+{y}")
 
     def _hide_tooltip(self):
@@ -854,6 +913,22 @@ def auto_type(text, target_hwnd=None):
     n = len(events)
     ctypes.windll.user32.SendInput(n, (INPUT * n)(*events), ctypes.sizeof(INPUT))
 
+def send_enter_key():
+    """Send a single Enter keypress via SendInput."""
+    VK_RETURN = 0x0D
+    events = []
+    for flags in (0, KEYEVENTF_KEYUP):
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.ki.wVk = VK_RETURN
+        inp.ki.wScan = 0
+        inp.ki.dwFlags = flags
+        inp.ki.time = 0
+        inp.ki.dwExtraInfo = _extra
+        events.append(inp)
+    n = len(events)
+    ctypes.windll.user32.SendInput(n, (INPUT * n)(*events), ctypes.sizeof(INPUT))
+
 
 # ── Transcription worker (queue consumer) ───────────────────────────────────
 
@@ -883,6 +958,10 @@ def _transcription_worker():
                         transcription_history.pop(0)
                 if not shutting_down[0]:
                     auto_type(text, target_hwnd=job.target_hwnd)
+                    if job.send_enter:
+                        time.sleep(0.05)
+                        send_enter_key()
+                        log(f"Sent Enter after transcription (job {job.job_id})")
                 else:
                     log(f"Shutdown: saved to history but skipped auto_type for job {job.job_id}")
         except Exception as e:
@@ -907,6 +986,7 @@ model_switching  = [False]
 discard_recording = [False]
 stop_event       = [threading.Event()]
 last_tap       = [0.0]
+enter_stop     = [False]   # True when recording was stopped via Enter key
 overlay        = None
 
 
@@ -919,6 +999,14 @@ def on_press(key):
     # Escape: quit — stop recording, hide overlay, let transcriptions finish (saved but not typed)
     if key == pynput.keyboard.Key.esc and overlay and overlay._visible:
         overlay.root.after(0, _do_exit)
+        return
+
+    # Enter key: stop recording + flag to send Enter after transcription
+    if key == pynput.keyboard.Key.enter and recording[0]:
+        recording[0] = False
+        enter_stop[0] = True
+        stop_event[0].set()
+        log("Recording stopped by Enter (will send Enter after transcription)")
         return
 
     if key != PTT_KEY or wmodel[0] is None or model_switching[0]:
@@ -953,6 +1041,7 @@ def _record_and_enqueue():
 
         if not audio or discard_recording[0]:
             discard_recording[0] = False
+            enter_stop[0] = False
             if not overlay._history_mode:
                 overlay.root.after(0, overlay.on_recording_stopped)
             log("Recording discarded" if audio else "No audio captured")
@@ -962,6 +1051,8 @@ def _record_and_enqueue():
         duration = len(audio) / (RATE * 2)  # 16-bit PCM = 2 bytes per sample
         app_name = get_process_name(target_hwnd)
         job_counter[0] += 1
+        _send_enter = enter_stop[0]
+        enter_stop[0] = False
         job = TranscriptionJob(
             job_id=job_counter[0],
             audio_bytes=audio,
@@ -969,6 +1060,7 @@ def _record_and_enqueue():
             window_name=window_name,
             app_name=app_name,
             audio_duration=duration,
+            send_enter=_send_enter,
         )
 
         with jobs_lock:
