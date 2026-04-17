@@ -90,6 +90,19 @@ KEY_MAP = {
 PTT_KEY          = KEY_MAP.get(cfg.get("push_to_talk_key", "ctrl_r"), pynput.keyboard.Key.ctrl_r)
 LANGUAGE         = cfg.get("language", "hu")
 RATE             = cfg.get("sample_rate", 16000)
+
+# Initial prompt: read from initial_prompt.md next to this script
+INITIAL_PROMPT_PATH = Path(__file__).parent / "initial_prompt.md"
+try:
+    INITIAL_PROMPT = INITIAL_PROMPT_PATH.read_text(encoding="utf-8").strip() or None
+    if INITIAL_PROMPT:
+        log(f"Loaded initial prompt ({len(INITIAL_PROMPT)} chars) from {INITIAL_PROMPT_PATH.name}")
+except FileNotFoundError:
+    INITIAL_PROMPT = None
+    log(f"No initial_prompt.md — Whisper will run without prompt bias")
+except Exception as e:
+    INITIAL_PROMPT = None
+    log(f"Failed to read {INITIAL_PROMPT_PATH}: {e}")
 CHUNK            = cfg.get("chunk_size", 1024)
 SILENCE_THRESH   = cfg.get("silence_threshold", 100)
 SILENCE_SECS     = cfg.get("silence_duration", 3.0)
@@ -144,6 +157,19 @@ class TranscriptionJob:
     created_at: float = field(default_factory=time.time)
     send_enter: bool = False
 
+@dataclass
+class BenchmarkJob:
+    job_id: int
+    audio_bytes: bytes
+    audio_duration: float
+    target_hwnd: int
+    window_name: str
+    app_name: str = ""
+    created_at: float = field(default_factory=time.time)
+    # Each item: {"model", "status" (waiting|downloading|running|done|error),
+    #             "transcribe_secs", "load_secs", "text", "error"}
+    results: list = field(default_factory=list)
+
 transcription_queue = queue.Queue()
 active_jobs = []
 jobs_lock = threading.Lock()
@@ -155,6 +181,12 @@ history_lock = threading.Lock()
 MAX_HISTORY = 50
 VISIBLE_HISTORY = 8   # max visible rows before scrollbar appears
 HISTORY_ITEM_H = 22   # pixels per history row
+
+# Benchmark state
+benchmark_next = [False]              # armed via tray menu toggle
+current_benchmark_job = [None]        # BenchmarkJob being processed (for live overlay)
+last_benchmark_job = [None]           # last finished BenchmarkJob (for "Open last benchmark")
+BENCHMARK_DIR = Path.home() / ".whispertype" / "benchmarks"
 
 
 # ── Tray icon ────────────────────────────────────────────────────────────────
@@ -330,6 +362,37 @@ class RecordingOverlay:
 
         self.history_item_widgets = []
 
+        # ── 5. Benchmark section ──
+        self.benchmark_frame = tk.Frame(self.root, bg=self.C["bg"])
+        tk.Frame(self.benchmark_frame, bg=self.C["sep"], height=1).pack(fill="x", padx=14, pady=(2, 4))
+        bench_hdr_row = tk.Frame(self.benchmark_frame, bg=self.C["bg"])
+        bench_hdr_row.pack(fill="x", padx=14)
+        bench_hdr_row.columnconfigure(2, weight=1)
+        _bf = ("Consolas", 8)
+        tk.Label(bench_hdr_row, text="BENCHMARK", bg=self.C["bg"], fg=self.C["dim"],
+                 font=("Segoe UI", 8, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        self.bench_title_lbl = tk.Label(bench_hdr_row, text="", bg=self.C["bg"],
+                                        fg=self.C["dim"], font=_bf, anchor="w")
+        self.bench_title_lbl.grid(row=0, column=2, sticky="we", padx=(8, 0))
+        bench_close = tk.Label(bench_hdr_row, text="\u00d7", bg=self.C["bg"],
+                               fg="#ef4444", font=("Segoe UI", 11, "bold"), cursor="hand2")
+        bench_close.grid(row=0, column=3, sticky="e", padx=(4, 0))
+        bench_close.bind("<Button-1>", lambda e: self._close_benchmark())
+        # Column headers
+        bench_cols = tk.Frame(self.benchmark_frame, bg=self.C["bg"])
+        bench_cols.pack(fill="x", padx=14, pady=(2, 0))
+        bench_cols.columnconfigure(2, weight=1)
+        for i, (txt, w, col) in enumerate([("MODEL", 16, 0), ("TIME", 8, 1)]):
+            tk.Label(bench_cols, text=txt, bg=self.C["bg"], fg=self.C["dim"],
+                     font=_bf, width=w, anchor="w").grid(row=0, column=col, sticky="w")
+        tk.Label(bench_cols, text="TEXT", bg=self.C["bg"], fg=self.C["dim"],
+                 font=_bf, anchor="w").grid(row=0, column=2, sticky="we", padx=(4, 0))
+        # Items frame (not scrollable — only 7 fixed rows)
+        self.benchmark_items_frame = tk.Frame(self.benchmark_frame, bg=self.C["bg"])
+        self.benchmark_items_frame.pack(fill="x", padx=14, pady=(0, 6))
+        self.benchmark_item_widgets = []
+        self._benchmark_view_job = None  # which BenchmarkJob is being displayed
+
         # ── Shared tooltip widget ──
         self._tooltip = None
         self._tooltip_after = None
@@ -347,6 +410,7 @@ class RecordingOverlay:
         self._recording = False
         self._visible = False
         self._history_mode = False
+        self._benchmark_mode = False
         self._pos = None
 
     # ── Layout helpers ──
@@ -368,10 +432,13 @@ class RecordingOverlay:
         self.rec_frame.pack_forget()
         self.queue_frame.pack_forget()
         self.history_frame.pack_forget()
+        self.benchmark_frame.pack_forget()
         if _nvml_ok:
             self.gpu_frame.pack(fill="x")
         self.rec_frame.pack(fill="x")
-        if self._history_mode:
+        if self._benchmark_mode:
+            self.benchmark_frame.pack(fill="x")
+        elif self._history_mode:
             self.history_frame.pack(fill="x")
         else:
             with jobs_lock:
@@ -383,9 +450,22 @@ class RecordingOverlay:
     def _update_state_display(self):
         """Update header (dot, state_lbl) and hint text based on current state."""
         if self._recording:
-            self.dot.config(fg=self.C["rec"])
-            self.state_lbl.config(text="Recording", fg=self.C["text"])
+            if benchmark_next[0]:
+                self.dot.config(fg=self.C["bar_mid"])
+                self.state_lbl.config(text="Recording (benchmark)", fg=self.C["bar_mid"])
+            else:
+                self.dot.config(fg=self.C["rec"])
+                self.state_lbl.config(text="Recording", fg=self.C["text"])
             self.hint.config(text="Transcribe: R-Ctrl / Enter\u21b5 / 3s silence  |  History: Space  |  Hide: Esc")
+        elif self._benchmark_mode:
+            running = current_benchmark_job[0] is not None
+            self.dot.config(fg=self.C["bar_mid"] if running else self.C["bar_lo"])
+            self.state_lbl.config(
+                text="Benchmarking..." if running else "Benchmark results",
+                fg=self.C["bar_mid"] if running else self.C["bar_lo"],
+            )
+            self.timer.config(text="")
+            self.hint.config(text="Close: \u00d7  |  Hide: Esc")
         elif self._history_mode:
             self.dot.config(fg=self.C["bar_lo"])
             self.state_lbl.config(text="History", fg=self.C["bar_lo"])
@@ -407,7 +487,10 @@ class RecordingOverlay:
         if _nvml_ok:
             h += 62
         h += 130  # recording section (includes hint inside rec_frame)
-        if self._history_mode:
+        if self._benchmark_mode:
+            # header (sep + BENCHMARK row + COLS row) + one row per model
+            h += 48 + len(ALL_MODELS) * HISTORY_ITEM_H
+        elif self._history_mode:
             with history_lock:
                 n = len(transcription_history)
             visible = min(n, VISIBLE_HISTORY) if n > 0 else 1
@@ -437,6 +520,7 @@ class RecordingOverlay:
     def show_recording(self, target_name=""):
         self._recording = True
         self._history_mode = False
+        self._benchmark_mode = False
         self._t0 = time.time()
         self.model_lbl.config(text=f"Model: {current_model_name[0]}")
         self.target_lbl.config(text=f"\u2192 {target_name}" if target_name else "")
@@ -481,7 +565,9 @@ class RecordingOverlay:
         self.rec_frame.pack_forget()
         self.queue_frame.pack_forget()
         self.history_frame.pack_forget()
+        self.benchmark_frame.pack_forget()
         self._history_mode = False
+        self._benchmark_mode = False
         self.root.attributes("-alpha", 0.0)
         self.root.geometry(OFF_SCREEN)
         self._visible = False
@@ -642,6 +728,124 @@ class RecordingOverlay:
         else:
             self._history_scrollbar.pack_forget()
             self._history_canvas.configure(height=len(items) * HISTORY_ITEM_H)
+
+    # ── Benchmark panel ──
+
+    def show_benchmark(self, job):
+        self._benchmark_view_job = job
+        self._benchmark_mode = True
+        self._history_mode = False
+        # If recording, cancel it — benchmark panel takes over
+        if self._recording:
+            self._recording = False
+            recording[0] = False
+            discard_recording[0] = True
+            stop_event[0].set()
+            self._cancel_timer_blink()
+        self._rebuild_benchmark()
+        self._show_overlay()
+
+    def refresh_benchmark(self):
+        # Prefer currently running job, fall back to last finished, else current view
+        job = current_benchmark_job[0] or last_benchmark_job[0] or self._benchmark_view_job
+        if job is None:
+            return
+        self._benchmark_view_job = job
+        if not self._benchmark_mode:
+            return
+        self._rebuild_benchmark()
+        self._update_state_display()
+
+    def _close_benchmark(self):
+        self._benchmark_mode = False
+        self._benchmark_view_job = None
+        # If a benchmark is still running, just hide the panel — worker keeps going
+        self.hide()
+
+    def _rebuild_benchmark(self):
+        for w in self.benchmark_item_widgets:
+            w.destroy()
+        self.benchmark_item_widgets = []
+
+        job = self._benchmark_view_job
+        if job is None:
+            return
+
+        created = time.strftime("%H:%M:%S", time.localtime(job.created_at))
+        self.bench_title_lbl.config(
+            text=f"{created}  \u2022  {job.audio_duration:.1f}s  \u2022  {job.app_name or '?'}"
+        )
+
+        _f = ("Consolas", 8)
+        _bg = self.C["bg"]
+
+        status_icons = {
+            "waiting": ("\u25cb", self.C["dim"]),        # ○
+            "downloading": ("\u2193", self.C["bar_mid"]),  # ↓
+            "loading": ("\u21bb", self.C["bar_mid"]),    # ↻
+            "running": ("\u25b6", self.C["trans"]),      # ▶
+            "done": ("\u2713", self.C["bar_lo"]),        # ✓
+            "error": ("\u00d7", "#ef4444"),              # ×
+        }
+
+        for r in job.results:
+            row = tk.Frame(self.benchmark_items_frame, bg=_bg)
+            row.pack(fill="x")
+            row.columnconfigure(2, weight=1)
+            self.benchmark_item_widgets.append(row)
+
+            icon, icon_col = status_icons.get(r["status"], ("?", self.C["dim"]))
+            name_txt = f"{icon} {r['model']}"
+            tk.Label(row, text=name_txt, bg=_bg, fg=icon_col, font=_f,
+                     width=18, anchor="w").grid(row=0, column=0, sticky="w")
+
+            if r["transcribe_secs"] is not None:
+                time_txt = f"{r['transcribe_secs']:.2f}s"
+                time_fg = self.C["bar_lo"]
+            elif r["status"] in ("running", "loading", "downloading"):
+                time_txt = "\u2026"
+                time_fg = self.C["bar_mid"]
+            elif r["status"] == "error":
+                time_txt = "ERR"
+                time_fg = "#ef4444"
+            else:
+                time_txt = "\u2014"
+                time_fg = self.C["dim"]
+            tk.Label(row, text=time_txt, bg=_bg, fg=time_fg, font=_f,
+                     width=8, anchor="w").grid(row=0, column=1, sticky="w")
+
+            if r["status"] == "done" and r["text"] is not None:
+                preview = r["text"][:40] + ("\u2026" if len(r["text"]) > 40 else "")
+                preview_fg = self.C["text"]
+            elif r["status"] == "error":
+                preview = (r["error"] or "error")[:40]
+                preview_fg = "#ef4444"
+            elif r["status"] == "downloading":
+                preview = "downloading..."
+                preview_fg = self.C["bar_mid"]
+            elif r["status"] == "loading":
+                preview = "loading model..."
+                preview_fg = self.C["bar_mid"]
+            elif r["status"] == "running":
+                preview = "transcribing..."
+                preview_fg = self.C["bar_mid"]
+            else:
+                preview = ""
+                preview_fg = self.C["dim"]
+
+            preview_lbl = tk.Label(row, text=preview, bg=_bg, fg=preview_fg,
+                                   font=_f, anchor="w")
+            preview_lbl.grid(row=0, column=2, sticky="we", padx=(4, 0))
+
+            if r["status"] == "done" and r["text"]:
+                full = r["text"]
+                tip = full[:500] + ("\u2026" if len(full) > 500 else "")
+                preview_lbl.bind("<Enter>", lambda e, p=tip: self._show_tooltip(e, p))
+                preview_lbl.bind("<Leave>", lambda e: self._hide_tooltip())
+                copy_btn = tk.Label(row, text="\U0001f4cb", bg=_bg,
+                                    fg=self.C["bar_lo"], font=("Segoe UI", 10), cursor="hand2")
+                copy_btn.grid(row=0, column=3, sticky="e", padx=(4, 0))
+                copy_btn.bind("<Button-1>", lambda e, t=full: self._copy_text(t))
 
     def _copy_text(self, text):
         self.root.clipboard_clear()
@@ -837,8 +1041,136 @@ def transcribe(audio_bytes):
     audio_np = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0
     # Use whisper.transcribe() with numpy array (no ffmpeg, handles any length)
     result = whisper.transcribe(wmodel[0], audio_np, language=LANGUAGE,
+                                initial_prompt=INITIAL_PROMPT,
                                 fp16=(DEVICE == "cuda"))
     return result["text"].strip()
+
+
+# ── Benchmark ────────────────────────────────────────────────────────────────
+
+def _save_benchmark(job):
+    try:
+        BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(job.created_at))
+        data = {
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job.created_at)),
+            "audio_duration_secs": round(job.audio_duration, 2),
+            "app": job.app_name,
+            "window": job.window_name,
+            "device": DEVICE,
+            "results": job.results,
+        }
+        json_path = BENCHMARK_DIR / f"benchmark_{ts}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        with open(BENCHMARK_DIR / "benchmark_log.txt", "a", encoding="utf-8") as f:
+            f.write(
+                f"\n=== {data['created_at']}  audio={data['audio_duration_secs']}s  "
+                f"app={job.app_name}  window={job.window_name}  device={DEVICE} ===\n"
+            )
+            for r in job.results:
+                t = f"{r['transcribe_secs']:.2f}s" if r['transcribe_secs'] is not None else "—"
+                txt = r['text'] if r['text'] is not None else (r['error'] or "")
+                f.write(f"  [{r['model']:<16}] {t:>7}  {txt}\n")
+        log(f"Benchmark saved: {json_path.name}")
+    except Exception as e:
+        log(f"Failed to save benchmark: {e}")
+
+
+def _run_benchmark(job):
+    log(f"Benchmark job {job.job_id} started ({job.audio_duration:.1f}s audio, {len(job.results)} models)")
+    original_model = current_model_name[0]
+    # Lock out dictation model switching while benchmark runs
+    model_switching[0] = True
+    current_benchmark_job[0] = job
+
+    audio_np = np.frombuffer(job.audio_bytes, np.int16).astype(np.float32) / 32768.0
+
+    def _refresh():
+        if overlay:
+            overlay.root.after(0, overlay.refresh_benchmark)
+
+    _refresh()
+
+    for i, r in enumerate(job.results):
+        name = r["model"]
+        try:
+            job.results[i]["status"] = "loading"
+            _refresh()
+
+            t0 = time.perf_counter()
+            m = whisper.load_model(name, device=DEVICE)
+            load_secs = time.perf_counter() - t0
+            job.results[i]["load_secs"] = load_secs
+
+            job.results[i]["status"] = "running"
+            _refresh()
+
+            t0 = time.perf_counter()
+            result = whisper.transcribe(m, audio_np, language=LANGUAGE,
+                                        initial_prompt=INITIAL_PROMPT,
+                                        fp16=(DEVICE == "cuda"))
+            transcribe_secs = time.perf_counter() - t0
+
+            job.results[i]["transcribe_secs"] = transcribe_secs
+            job.results[i]["text"] = result["text"].strip()
+            job.results[i]["status"] = "done"
+            log(f"Benchmark [{name}] {transcribe_secs:.2f}s: {job.results[i]['text'][:60]}")
+
+            # Free GPU memory before next model
+            del m
+            if DEVICE == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception as e:
+            job.results[i]["status"] = "error"
+            job.results[i]["error"] = str(e)
+            log(f"Benchmark [{name}] ERROR: {e}")
+        _refresh()
+
+    # Persist result + restore original model
+    _save_benchmark(job)
+    last_benchmark_job[0] = job
+    current_benchmark_job[0] = None
+
+    try:
+        log(f"Restoring original model: {original_model}")
+        wmodel[0] = whisper.load_model(original_model, device=DEVICE)
+    except Exception as e:
+        log(f"Failed to restore model {original_model}: {e}")
+
+    model_switching[0] = False
+    refresh_tray()
+    _refresh()
+    log(f"Benchmark job {job.job_id} complete")
+
+
+def _ensure_all_models_downloaded():
+    """Background: pre-download any missing Whisper models onto CPU (cache only)."""
+    missing = [n for n, _ in ALL_MODELS if not is_model_downloaded(n)]
+    if not missing:
+        log("All Whisper models already downloaded.")
+        return
+    log(f"Pre-downloading {len(missing)} missing model(s): {', '.join(missing)}")
+    for name in missing:
+        try:
+            log(f"Downloading {name}...")
+            # Load on CPU so GPU memory isn't touched; only the cached .pt file matters.
+            # Immediately release RAM — we don't keep the loaded weights around.
+            m = whisper.load_model(name, device="cpu")
+            del m
+            log(f"Downloaded {name}.")
+            # Refresh tray so ↓ arrow disappears
+            if tray_icon[0]:
+                try:
+                    tray_icon[0].menu = build_tray_menu()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"Failed to pre-download {name}: {e}")
+    log("Background model download finished.")
 
 
 # ── Auto-type via Win32 SendInput ────────────────────────────────────────────
@@ -994,6 +1326,25 @@ def send_enter_key():
 def _transcription_worker():
     while True:
         job = transcription_queue.get()
+
+        if isinstance(job, BenchmarkJob):
+            try:
+                if tray_icon[0]:
+                    tray_icon[0].icon = make_tray_icon("transcribing")
+                overlay.root.after(0, lambda j=job: overlay.show_benchmark(j))
+                _run_benchmark(job)
+            except Exception as e:
+                import traceback
+                log(f"Benchmark worker error (job {job.job_id}): {e}")
+                log(traceback.format_exc())
+            finally:
+                transcription_queue.task_done()
+                overlay.root.after(0, overlay.refresh_benchmark)
+                if transcription_queue.qsize() == 0 and not recording[0]:
+                    if tray_icon[0]:
+                        tray_icon[0].icon = make_tray_icon("idle")
+            continue
+
         try:
             job.status = JobStatus.TRANSCRIBING
             overlay.root.after(0, overlay.refresh)
@@ -1122,6 +1473,34 @@ def _record_and_enqueue():
         job_counter[0] += 1
         _send_enter = enter_stop[0]
         enter_stop[0] = False
+
+        if benchmark_next[0]:
+            benchmark_next[0] = False
+            refresh_tray()  # updates the checkbox state
+            downloaded_models = [m for m, _ in ALL_MODELS if is_model_downloaded(m)]
+            if not downloaded_models:
+                log("Benchmark skipped: no models downloaded")
+                overlay.root.after(0, overlay.on_recording_stopped)
+                return
+            job = BenchmarkJob(
+                job_id=job_counter[0],
+                audio_bytes=audio,
+                audio_duration=duration,
+                target_hwnd=target_hwnd,
+                window_name=window_name,
+                app_name=app_name,
+                results=[{"model": m, "status": "waiting",
+                          "transcribe_secs": None, "load_secs": None,
+                          "text": None, "error": None}
+                         for m in downloaded_models],
+            )
+            overlay.root.after(0, overlay.on_recording_stopped)
+            transcription_queue.put(job)
+            log(f"Enqueued BENCHMARK job {job.job_id} ({duration:.1f}s, {len(downloaded_models)} downloaded models)")
+            if tray_icon[0]:
+                tray_icon[0].icon = make_tray_icon("transcribing")
+            return
+
         job = TranscriptionJob(
             job_id=job_counter[0],
             audio_bytes=audio,
@@ -1180,8 +1559,31 @@ def build_tray_menu():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Model", pystray.Menu(*items)),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Benchmark next recording",
+            on_toggle_benchmark,
+            checked=lambda item: benchmark_next[0],
+        ),
+        pystray.MenuItem(
+            "Open last benchmark",
+            on_open_last_benchmark,
+            enabled=lambda item: last_benchmark_job[0] is not None,
+        ),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit", on_tray_exit),
     )
+
+
+def on_toggle_benchmark(icon, item):
+    benchmark_next[0] = not benchmark_next[0]
+    log(f"Benchmark mode {'ARMED' if benchmark_next[0] else 'disarmed'}")
+    refresh_tray()
+
+
+def on_open_last_benchmark(icon, item):
+    job = last_benchmark_job[0]
+    if job and overlay:
+        overlay.root.after(0, lambda: overlay.show_benchmark(job))
 
 def switch_model(name):
     if transcription_queue.qsize() > 0:
