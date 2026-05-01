@@ -17,6 +17,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 import queue
+import gc
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 LOG = Path(__file__).parent / "voice_daemon.log"
@@ -1040,10 +1041,25 @@ def transcribe(audio_bytes):
     # Convert raw PCM to float32 numpy — bypasses whisper.load_audio() / ffmpeg
     audio_np = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0
     # Use whisper.transcribe() with numpy array (no ffmpeg, handles any length)
+    # condition_on_previous_text=False prevents hallucination loops on long audio
     result = whisper.transcribe(wmodel[0], audio_np, language=LANGUAGE,
                                 initial_prompt=INITIAL_PROMPT,
+                                condition_on_previous_text=False,
+                                compression_ratio_threshold=2.4,
+                                logprob_threshold=-1.0,
+                                no_speech_threshold=0.6,
                                 fp16=(DEVICE == "cuda"))
-    return result["text"].strip()
+    text = result["text"].strip()
+    # Free Whisper's intermediate tensors + PyTorch's CUDA cache. Without this,
+    # 4 days of dictation accumulates ~7 GB of allocator fragmentation.
+    del result, audio_np
+    gc.collect()
+    if DEVICE == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return text
 
 
 # ── Benchmark ────────────────────────────────────────────────────────────────
@@ -1109,6 +1125,10 @@ def _run_benchmark(job):
             t0 = time.perf_counter()
             result = whisper.transcribe(m, audio_np, language=LANGUAGE,
                                         initial_prompt=INITIAL_PROMPT,
+                                        condition_on_previous_text=False,
+                                        compression_ratio_threshold=2.4,
+                                        logprob_threshold=-1.0,
+                                        no_speech_threshold=0.6,
                                         fp16=(DEVICE == "cuda"))
             transcribe_secs = time.perf_counter() - t0
 
