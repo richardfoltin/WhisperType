@@ -13,8 +13,8 @@ from pathlib import Path
 import pynput.keyboard
 
 from . import __version__, audio, config
-from .jobs import (BenchmarkJob, BenchmarkResult, JobQueue, JobStatus,
-                   ModelSwitch, ModelUnload, TranscriptionJob)
+from .jobs import (BenchmarkJob, BenchmarkResult, EngineSwitch, JobQueue,
+                   JobStatus, ModelSwitch, ModelUnload, TranscriptionJob)
 from . import transcribe as transcribe_mod
 from .log import log
 from .transcribe import create_engine
@@ -48,19 +48,15 @@ class App:
         self.backend = backend
         self.jobs = JobQueue()
         self.jobs.load_history()
-        self.engine = create_engine()
-        # Half precision is the right default on Turing and newer; on Pascal
-        # it can be slower than fp32, so it stays overridable.
-        if hasattr(self.engine, "fp16"):
-            self.engine.fp16 = bool(self.cfg.get("fp16", self.engine.fp16))
-            log(f"fp16={self.engine.fp16}")
+        self.engine = create_engine(self.cfg)
+        self._apply_engine_options()
 
         self.ptt_key = KEY_MAP.get(self.cfg.ptt_key_name,
                                    pynput.keyboard.Key.ctrl_r)
         self.ptt_label = KEY_LABEL.get(self.cfg.ptt_key_name,
                                        self.cfg.ptt_key_name)
 
-        self.model_name = self.cfg.get("last_model", "large-v3-turbo")
+        self.model_name = self._model_for_engine()
         self.model_ready = False
         self.model_switching = False
 
@@ -105,6 +101,7 @@ class App:
         self.gpu_lock = threading.Lock()
 
         self._last_activity = time.monotonic()
+        self._idle_thread_running = False
 
         self.ui = ui_factory(self)
         self.backend.set_own_window_provider(self.ui.own_window_ids)
@@ -123,8 +120,7 @@ class App:
         threading.Thread(target=self._worker, daemon=True).start()
 
         if self.cfg.idle_unload_seconds > 0:
-            threading.Thread(target=self._idle_watchdog, daemon=True).start()
-            log(f"Idle unload after {self.cfg.idle_unload_seconds / 60:.0f} min")
+            self._start_idle_watchdog()
 
         self._listener = pynput.keyboard.Listener(on_press=self._on_press)
         self._listener.start()
@@ -205,6 +201,14 @@ class App:
     def _touch(self):
         self._last_activity = time.monotonic()
 
+    def _start_idle_watchdog(self):
+        """Idempotent: the menu can switch idle-unload on after boot."""
+        if self._idle_thread_running:
+            return
+        self._idle_thread_running = True
+        threading.Thread(target=self._idle_watchdog, daemon=True).start()
+        log(f"Idle unload after {self.cfg.idle_unload_seconds / 60:.0f} min")
+
     def _idle_watchdog(self):
         """Release the model after a configurable idle period.
 
@@ -225,6 +229,92 @@ class App:
                 self.jobs.submit_control(ModelUnload())
 
     # ── Model handling ───────────────────────────────────────────────────
+
+    def _apply_engine_options(self):
+        # Half precision is the right default on Turing and newer; on Pascal it
+        # can be slower than fp32, so it stays overridable. Absent on the API
+        # engine, which decides nothing locally.
+        if hasattr(self.engine, "fp16"):
+            self.engine.fp16 = bool(self.cfg.get("fp16", self.engine.fp16))
+            log(f"fp16={self.engine.fp16}")
+
+    def _model_for_engine(self):
+        """Each engine remembers its own model — the names do not overlap."""
+        if self.cfg.stt_engine == "openai":
+            return self.cfg.openai_model
+        return self.cfg.get("last_model", "large-v3-turbo")
+
+    def _remember_model(self, name):
+        if self.cfg.stt_engine == "openai":
+            self.cfg.set("openai_model", name)
+        else:
+            self.cfg.set("last_model", name)
+        self.cfg.save()
+
+    # ── Engine (local GPU vs hosted API) ─────────────────────────────────
+
+    @property
+    def engine_kind(self):
+        return self.cfg.stt_engine
+
+    def request_engine(self, kind):
+        """Switch between the local model and the hosted API."""
+        if kind == self.cfg.stt_engine or self.recording or self.model_switching:
+            return
+        if kind == "openai" and not self.cfg.openai_api_key:
+            self.set_error("No OpenAI API key — set one from the menu first")
+            return
+        self.model_switching = True
+        self.ui.set_tray_state("loading")
+        self.jobs.submit_control(EngineSwitch(kind))
+
+    def _handle_engine_switch(self, msg):
+        previous = self.cfg.stt_engine
+        try:
+            # Release the outgoing engine's memory before building the next.
+            try:
+                self.engine.unload()
+            except Exception as e:
+                log(f"Could not unload the previous engine: {e}")
+            self.cfg.set("stt_engine", msg.engine)
+            self.engine = create_engine(self.cfg)
+            self._apply_engine_options()
+            self.model_name = self._model_for_engine()
+            self.engine.load(self.model_name)
+            self.model_ready = True
+            self.cfg.save()
+            self.clear_error()
+            self.ui.set_tray_state("idle")
+            log(f"Engine switched to {msg.engine} ({self.model_name})")
+        except Exception as e:
+            # Fall back to what was working rather than leaving no engine.
+            self.cfg.set("stt_engine", previous)
+            self.model_ready = False
+            self.set_error(f"Could not switch to {msg.engine}: {e}")
+            try:
+                self.engine = create_engine(self.cfg)
+                self._apply_engine_options()
+                self.model_name = self._model_for_engine()
+                self.engine.load(self.model_name)
+                self.model_ready = True
+            except Exception as e2:
+                log(f"Could not restore the {previous} engine either: {e2}")
+        finally:
+            self.model_switching = False
+            self.ui.call_soon(self.ui.refresh_tray)
+
+    def set_api_key(self, key):
+        """Store the key and, if the API engine is selected, re-validate it."""
+        if not key or not key.strip():
+            return False
+        if not self.cfg.write_api_key(key):
+            self.set_error("Could not write the API key file")
+            return False
+        self.clear_error()
+        if hasattr(self.engine, "refresh_models"):
+            self.engine.refresh_models()
+        self.ui.call_soon(self.ui.refresh_tray)
+        return True
 
     def model_catalog(self):
         return self.engine.catalog()
@@ -265,6 +355,9 @@ class App:
         while True:
             item = self.jobs.take()
             try:
+                if isinstance(item, EngineSwitch):
+                    self._handle_engine_switch(item)
+                    continue
                 if isinstance(item, ModelSwitch):
                     self._handle_model_switch(item)
                     continue
@@ -296,8 +389,7 @@ class App:
             self.model_ready = True
             # Only persist a model that actually loaded, or one bad switch
             # would break the next launch too.
-            self.cfg.set("last_model", msg.name)
-            self.cfg.save()
+            self._remember_model(msg.name)
             self.clear_error()
             self.ui.set_tray_state("idle")
         except Exception as e:
@@ -700,6 +792,34 @@ class App:
         self.jobs.cancel(job)
         log(f"Cancelled job {job.job_id}")
         self.ui.refresh()
+
+    def set_language(self, code):
+        """Language is read fresh for every job, so this needs no restart."""
+        if code == self.cfg.language:
+            return
+        self.cfg.set("language", code)
+        self.cfg.save()
+        log(f"Language set to {code}")
+        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.show_notice(f"Language: {code}")
+
+    def set_idle_unload(self, minutes):
+        """Change when an idle model is released. 0 keeps it resident.
+
+        The watchdog re-reads the limit on every pass, so the only thing that
+        needs starting is the thread itself, when it was switched off at boot.
+        """
+        if abs(self.cfg.idle_unload_seconds - minutes * 60) < 1:
+            return
+        self.cfg.set("idle_unload_minutes", minutes)
+        self.cfg.save()
+        log(f"Idle unload set to {minutes} min" if minutes
+            else "Idle unload disabled — model stays resident")
+        if minutes > 0 and not self._idle_thread_running:
+            self._start_idle_watchdog()
+        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.show_notice("Model stays resident" if not minutes
+                            else f"Release model after {minutes} min")
 
     def set_paused(self, paused):
         self.paused = paused

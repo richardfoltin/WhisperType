@@ -6,3 +6,10 @@ voice_daemon.prev.log
 *.egg-info/
 dist/
 build/
+
+# Secrets. These live in ~/.whispertype/ and never here, but a stray copy in
+# the working tree must not be committable either.
+openai_api_key
+*.key
+.env
+.env.*

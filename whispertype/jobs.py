@@ -37,6 +37,16 @@ class ModelSwitch:
 
 
 @dataclass
+class EngineSwitch:
+    """Control message: swap the whole speech-to-text engine (local <-> API).
+
+    Goes through the queue for the same reason ModelSwitch does — the engine
+    object is only ever touched by the transcription worker.
+    """
+    engine: str          # "local" | "openai"
+
+
+@dataclass
 class ModelUnload:
     """Control message: release the model to reclaim memory after an idle
     period. Goes through the queue for the same reason ModelSwitch does — MLX

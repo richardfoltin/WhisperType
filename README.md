@@ -188,6 +188,34 @@ The results panel is Windows-only: the macOS overlay is an HTML page with no tab
 
 ---
 
+## OpenAI API mode
+
+WhisperType normally runs Whisper on your own machine. The tray / menu bar ▸ **Engine** switches it to OpenAI's hosted transcription API instead — useful on a machine with no usable GPU, or when you want a model you cannot run locally.
+
+| | Local | OpenAI API |
+|---|---|---|
+| Where the audio goes | nowhere | uploaded to OpenAI |
+| Cost | none | per minute of audio |
+| First-use wait | model download + load | none |
+| Works offline | yes | no |
+| Models | `large-v3-turbo` … `tiny` | `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `whisper-1`, … |
+
+The model list is fetched live from `/v1/models`, so new models appear without an update here; a built-in list is used if the request fails.
+
+### The API key
+
+Set it from **Engine ▸ Set API key…**, or place it yourself. WhisperType looks in this order:
+
+1. the `OPENAI_API_KEY` environment variable
+2. `~/.whispertype/openai_api_key` — a file of its own, mode `600`
+3. `"openai_api_key"` in `config.json`
+
+The first two are preferred, and the menu writes to (2). Keeping the key out of `config.json` matters because that file is the one people paste into bug reports. **None of these locations is inside the repository**, so the key cannot reach git. It is never written to `voice_daemon.log` either — API errors are logged without the request headers.
+
+Switching engines does not lose anything: each engine remembers its own model, and if the switch fails WhisperType falls back to the engine that was working and says why.
+
+---
+
 ## Vocabulary bias
 
 `initial_prompt.md`, next to the script, is fed to Whisper as its `initial_prompt`. Put your jargon in it — project names, library names, anything Whisper keeps mishearing — and transcription accuracy on those words improves sharply.
@@ -277,6 +305,10 @@ Edit `%USERPROFILE%\.whispertype\config.json` (Windows) or `~/.whispertype/confi
 | `min_speech_seconds` | `0.25` | A clip with less speech than this is discarded instead of transcribed. Whisper reliably invents a sentence for silence, and an accidental double-tap would otherwise type it into your document. |
 | `idle_unload_minutes` | `10` | Release the model after this many idle minutes (`0` = keep it resident). Measured: 1799 MB → 260 MB, and reloading from the local cache takes about a second. |
 | `theme` | `"auto"` | Overlay appearance: `auto` follows the system, or pin it with `dark` / `light`. |
+| `stt_engine` | `"local"` | `local` runs Whisper here; `openai` uses the hosted API (see above) |
+| `openai_model` | `"gpt-4o-transcribe"` | Model used in API mode |
+| `openai_endpoint` | `https://api.openai.com/v1` | Override for an Azure/compatible endpoint |
+| `openai_api_key` | `null` | Last-resort key location — prefer the env var or the key file |
 | `last_model` | *(written by the app)* | Model chosen from the tray / menu bar |
 
 Unrecognised keys are listed in `voice_daemon.log` at startup, so a typo shows up instead of silently doing nothing.

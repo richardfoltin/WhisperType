@@ -7,21 +7,41 @@ the platform-neutral UI interface that `whispertype.app.App` drives.
 This module is Windows-only. On macOS Tk activates the application on every
 window map, which would steal focus from the window we are about to type into.
 """
+import os
 import threading
 import time
 import tkinter as tk
 
 import pystray
 
+from ..config import API_KEY_PATH
 from ..icon import make_tray_icon
 from ..jobs import JobStatus
-from ..log import log
+from ..log import LOG_PATH, log
 
 OFF_SCREEN = "-9999+-9999"
 OV_W = 380
 MAX_QUEUE_VISIBLE = 5
 VISIBLE_HISTORY = 8
 HISTORY_ITEM_H = 22
+
+#: Offered in the Language submenu — the same list the macOS menu bar shows.
+#: `language` is read fresh for every job, so switching needs no restart.
+LANGUAGES = [
+    ("en", "English"), ("hu", "Magyar"), ("de", "Deutsch"),
+    ("fr", "Français"), ("es", "Español"), ("it", "Italiano"),
+    ("pt", "Português"), ("nl", "Nederlands"), ("pl", "Polski"),
+    ("ru", "Русский"), ("ja", "日本語"), ("zh", "中文"),
+]
+
+#: Idle-unload choices. Reloading from the local cache costs about a second,
+#: so holding ~1.6 GB resident all day for a tool used a few times an hour is
+#: a bad trade — but it is a trade, so it is a setting.
+IDLE_CHOICES = [
+    (0, "Never (keep resident)"), (2, "After 2 minutes"),
+    (5, "After 5 minutes"), (10, "After 10 minutes"),
+    (30, "After 30 minutes"), (60, "After 1 hour"),
+]
 
 
 class TkUI:
@@ -852,17 +872,67 @@ class TkUI:
             items.append(pystray.MenuItem(label, make_act(info.name),
                                           checked=make_checked(info.name)))
 
+        local = self.app.engine_kind == "local"
+
+        engines = pystray.Menu(
+            pystray.MenuItem(
+                "Local (this machine)",
+                lambda icon, item: self.app.request_engine("local"),
+                checked=lambda item: self.app.engine_kind == "local", radio=True),
+            pystray.MenuItem(
+                "OpenAI API",
+                lambda icon, item: self.app.request_engine("openai"),
+                checked=lambda item: self.app.engine_kind == "openai", radio=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                lambda item: ("Set API key…" if not self.app.cfg.api_key_source
+                              else f"Replace API key ({self.app.cfg.api_key_source})…"),
+                lambda icon, item: self.ask_api_key()),
+        )
+
+        languages = pystray.Menu(*[
+            pystray.MenuItem(
+                f"{name} ({code})",
+                (lambda c: lambda icon, item: self.app.set_language(c))(code),
+                checked=(lambda c: lambda item: c == self.app.cfg.language)(code),
+                radio=True)
+            for code, name in LANGUAGES])
+
+        idle = pystray.Menu(*[
+            pystray.MenuItem(
+                label,
+                (lambda m: lambda icon, item: self.app.set_idle_unload(m))(minutes),
+                checked=(lambda m: lambda item:
+                         abs(self.app.cfg.idle_unload_seconds - m * 60) < 1)(minutes),
+                radio=True)
+            for minutes, label in IDLE_CHOICES])
+
         return pystray.Menu(
             pystray.MenuItem("WhisperType", None, enabled=False),
+            pystray.MenuItem(lambda item: f"Record: double-tap {self.app.ptt_label}",
+                             None, enabled=False),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Show history",
+                             lambda icon, item: self.app.show_history()),
+            pystray.MenuItem("Pause dictation",
+                             lambda icon, item: self.app.set_paused(not self.app.paused),
+                             checked=lambda item: self.app.paused),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Engine", engines),
             pystray.MenuItem("Model", pystray.Menu(*items)),
+            pystray.MenuItem("Language", languages),
+            pystray.MenuItem("Release model when idle", idle),
             pystray.MenuItem(
                 "Download all models",
                 lambda icon, item: self.app.download_all_models(),
+                # Nothing to download when the models live on OpenAI's servers.
+                visible=lambda item: local,
                 enabled=lambda item: (not self.app.downloading_all
                                       and any(not i.downloaded
                                               for i in self.app.model_catalog())),
             ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open log", lambda icon, item: self.open_log()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Benchmark next recording",
@@ -875,8 +945,76 @@ class TkUI:
                 enabled=lambda item: self.app.last_benchmark is not None,
             ),
             pystray.Menu.SEPARATOR,
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda icon, item: self.app.quit()),
         )
+
+    def open_log(self):
+        try:
+            os.startfile(LOG_PATH)          # noqa: S606 — Windows shell open
+        except Exception as e:
+            log(f"Could not open the log: {e}")
+
+    def ask_api_key(self):
+        """Prompt for the OpenAI key. Runs on the Tk thread; the tray callback
+        arrives on pystray's thread, so it has to be marshalled."""
+        self.root.after(0, self._ask_api_key)
+
+    def _ask_api_key(self):
+        win = tk.Toplevel(self.root)
+        win.title("OpenAI API key")
+        win.configure(bg=self.C["bg"])
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+
+        source = self.app.cfg.api_key_source
+        blurb = (f"A key is already set (from the {source})."
+                 if source else "No key is set yet.")
+        tk.Label(win, text=blurb, bg=self.C["bg"], fg=self.C["dim"],
+                 font=("Segoe UI", 9)).pack(padx=16, pady=(14, 2), anchor="w")
+        tk.Label(win,
+                 text=f"Stored in {API_KEY_PATH} — never in config.json,\n"
+                      f"and never inside the repository.",
+                 bg=self.C["bg"], fg=self.C["dim"], font=("Segoe UI", 8),
+                 justify="left").pack(padx=16, pady=(0, 8), anchor="w")
+
+        # show="•": the key must not be readable over the user's shoulder, and
+        # it is never echoed to the log either.
+        entry = tk.Entry(win, width=52, show="•", font=("Consolas", 10))
+        entry.pack(padx=16, pady=(0, 4))
+        entry.focus_set()
+
+        status = tk.Label(win, text="", bg=self.C["bg"], fg="#ef4444",
+                          font=("Segoe UI", 8))
+        status.pack(padx=16, anchor="w")
+
+        def save(_event=None):
+            key = entry.get().strip()
+            if not key:
+                status.config(text="Enter a key, or press Cancel.")
+                return
+            if not key.startswith("sk-"):
+                status.config(text="That does not look like an OpenAI key (sk-…).")
+                return
+            entry.delete(0, "end")
+            if self.app.set_api_key(key):
+                win.destroy()
+                self.show_notice("API key saved")
+            else:
+                status.config(text="Could not write the key file — see the log.")
+
+        buttons = tk.Frame(win, bg=self.C["bg"])
+        buttons.pack(padx=16, pady=12, anchor="e")
+        tk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right")
+        tk.Button(buttons, text="Save", command=save).pack(side="right", padx=(0, 8))
+        entry.bind("<Return>", save)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_screenwidth() // 2 - win.winfo_reqwidth() // 2
+        win.geometry(f"+{x}+240")
+        win.lift()
+        win.grab_set()
 
     def set_tray_state(self, state):
         self._tray_state = state

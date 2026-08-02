@@ -10,13 +10,21 @@ THREADING: MLX is thread-affine — the stream that loads a model must be the on
 that evaluates it. Every method here must therefore be called from the single
 transcription worker thread, including the initial load and any model switch.
 """
+import io
+import json
+import re
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from .config import API_KEY_PATH
 from .log import log
 
 IS_MAC = sys.platform == "darwin"
@@ -358,5 +366,187 @@ class MlxEngine:
         return result["text"].strip()
 
 
-def create_engine():
+# ── OpenAI hosted API ────────────────────────────────────────────────────────
+
+#: Used when /v1/models cannot be reached. The live list is preferred so new
+#: models appear without a release here.
+OPENAI_FALLBACK_MODELS = [
+    "gpt-4o-transcribe",
+    "gpt-4o-mini-transcribe",
+    "whisper-1",
+]
+
+#: What counts as a speech-to-text model in /v1/models. Without a filter the
+#: TTS models (tts-1*) leak into the same list.
+_OPENAI_STT_RE = re.compile(r"^(whisper-|gpt-4o.*transcribe|gpt-realtime.*)")
+
+#: Dated snapshots (…-2025-12-15) are reproducibility pins of the evergreen
+#: base model; hiding them keeps the menu scannable.
+_OPENAI_PINNED_RE = re.compile(r"-\d{4}(-\d{2}-\d{2})?$")
+
+#: Realtime models are not served on POST /v1/audio/transcriptions — the API
+#: answers 404 "Invalid URL" — so map them to the closest HTTP model.
+_HTTP_FALLBACK = "gpt-4o-transcribe"
+
+
+class OpenAiEngine:
+    """OpenAI's hosted transcription API.
+
+    The opposite trade from the local engines: nothing to download, no GPU and
+    no model-load wait — but the audio leaves the machine and every clip costs
+    money. Selected with "stt_engine": "openai".
+    """
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self._name = cfg.openai_model
+        self._models = None          # cached /v1/models result
+        self._ready = False
+        log(f"OpenAI API engine ({self._name}) at {cfg.openai_endpoint}")
+
+    # ── Engine interface ──
+
+    @property
+    def device_label(self):
+        return "OpenAI API"
+
+    @property
+    def loaded(self):
+        return self._ready
+
+    def is_downloaded(self, name):
+        return True              # nothing is ever downloaded
+
+    def predownload(self, name):
+        pass
+
+    def free_cache(self):
+        pass
+
+    def unload(self):
+        # Nothing is resident; the idle watchdog has nothing to reclaim.
+        self._ready = False
+
+    def catalog(self):
+        names = self._model_names()
+        return [ModelInfo(n, "API", True) for n in names]
+
+    def load(self, name):
+        if not self._cfg.openai_api_key:
+            raise RuntimeError(
+                "No OpenAI API key. Set OPENAI_API_KEY, or write the key to "
+                f"{API_KEY_PATH}, or use the tray menu.")
+        if name not in self._model_names():
+            log(f"{name} is not in the model list; using it anyway")
+        self._name = name
+        self._ready = True
+        log(f"OpenAI model set to {name}")
+
+    def transcribe(self, audio_bytes, language):
+        if not self._ready:
+            raise RuntimeError("OpenAI engine is not configured")
+        return self._post(self._name, audio_bytes, language)
+
+    # ── Benchmark hooks ──
+
+    def load_for_benchmark(self, name):
+        return name, 0.0         # no load step; the "model" is just its name
+
+    def transcribe_with(self, model, audio_bytes, language):
+        return self._post(model, audio_bytes, language)
+
+    # ── Internals ──
+
+    def _model_names(self):
+        if self._models is not None:
+            return self._models
+        key = self._cfg.openai_api_key
+        if not key:
+            self._models = list(OPENAI_FALLBACK_MODELS)
+            return self._models
+        try:
+            req = urllib.request.Request(
+                f"{self._cfg.openai_endpoint}/models",
+                headers={"Authorization": f"Bearer {key}"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.load(resp)
+            names = sorted(
+                m["id"] for m in data.get("data", [])
+                if _OPENAI_STT_RE.match(m.get("id", ""))
+                and not _OPENAI_PINNED_RE.search(m.get("id", "")))
+            self._models = names or list(OPENAI_FALLBACK_MODELS)
+            log(f"OpenAI STT models: {', '.join(self._models)}")
+        except Exception as e:
+            log(f"Could not list OpenAI models ({e}) — using the built-in list")
+            self._models = list(OPENAI_FALLBACK_MODELS)
+        return self._models
+
+    def refresh_models(self):
+        self._models = None
+        return self._model_names()
+
+    def _post(self, model, audio_bytes, language):
+        # Realtime models only exist on the websocket surface.
+        if model.startswith("gpt-realtime"):
+            model = _HTTP_FALLBACK
+        key = self._cfg.openai_api_key
+        if not key:
+            raise RuntimeError("No OpenAI API key configured")
+
+        fields = [("model", model), ("language", language)]
+        prompt = initial_prompt()
+        if prompt:
+            fields.append(("prompt", prompt))
+        body, content_type = _multipart(
+            fields, "file", "audio.wav", _pcm16_to_wav(audio_bytes, 16000))
+
+        req = urllib.request.Request(
+            f"{self._cfg.openai_endpoint}/audio/transcriptions",
+            data=body, method="POST",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": content_type})
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.load(resp)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            # Never let the key reach the log or the error surface.
+            raise RuntimeError(f"OpenAI API {e.code}: {detail}") from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"OpenAI API unreachable: {e.reason}") from None
+        return (data.get("text") or "").strip()
+
+
+def _pcm16_to_wav(pcm, rate):
+    """Wrap raw mono 16-bit PCM in a WAV container — the API needs a file."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _multipart(fields, file_field, filename, file_bytes):
+    """Minimal multipart/form-data encoder, to avoid a requests dependency."""
+    boundary = "----WhisperType" + uuid.uuid4().hex
+    out = bytearray()
+    for name, value in fields:
+        out += (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n").encode("utf-8")
+    out += (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}";'
+            f' filename="{filename}"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n").encode("utf-8")
+    out += file_bytes
+    out += f"\r\n--{boundary}--\r\n".encode("utf-8")
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
+
+
+def create_engine(cfg=None):
+    """Local GPU engine, or the hosted API when the config asks for it."""
+    if cfg is not None and cfg.stt_engine == "openai":
+        return OpenAiEngine(cfg)
     return MlxEngine() if IS_MAC else WhisperEngine()

@@ -14,6 +14,10 @@ from .log import log
 CONFIG_DIR = Path.home() / ".whispertype"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+#: Preferred home for the OpenAI key: a file of its own, so the key never has
+#: to sit in a config people paste into issues, and never near the repo.
+API_KEY_PATH = CONFIG_DIR / "openai_api_key"
+
 IS_MAC = sys.platform == "darwin"
 
 # Right Ctrl does not exist on Apple keyboards, so macOS defaults to Right
@@ -39,6 +43,14 @@ DEFAULTS = {
     "min_speech_seconds": 0.25,
     #: "auto" follows the system appearance; "dark" / "light" pin it.
     "theme": "auto",
+    #: "local" runs Whisper on this machine; "openai" sends the audio to
+    #: OpenAI's hosted transcription API instead.
+    "stt_engine": "local",
+    "openai_model": "gpt-4o-transcribe",
+    "openai_endpoint": "https://api.openai.com/v1",
+    #: Leave null and put the key in ~/.whispertype/openai_api_key (or the
+    #: OPENAI_API_KEY environment variable) instead — see the api_key property.
+    "openai_api_key": None,
 }
 
 
@@ -133,6 +145,76 @@ class Config:
                                            DEFAULTS["min_speech_seconds"])))
         except (TypeError, ValueError):
             return DEFAULTS["min_speech_seconds"]
+
+    # ── OpenAI API mode ──
+
+    @property
+    def stt_engine(self):
+        value = str(self.get("stt_engine", "local")).lower()
+        return value if value in ("local", "openai") else "local"
+
+    @property
+    def openai_model(self):
+        return self.get("openai_model", DEFAULTS["openai_model"])
+
+    @property
+    def openai_endpoint(self):
+        return str(self.get("openai_endpoint",
+                            DEFAULTS["openai_endpoint"])).rstrip("/")
+
+    @property
+    def openai_api_key(self):
+        """Resolved from, in order: the environment, a key file, the config.
+
+        The file and the environment come first so the key never has to live in
+        config.json — that file gets pasted into bug reports, and this one does
+        not. Nothing here is ever logged.
+        """
+        env = os.environ.get("OPENAI_API_KEY", "").strip()
+        if env:
+            return env
+        try:
+            if API_KEY_PATH.exists():
+                key = API_KEY_PATH.read_text(encoding="utf-8").strip()
+                if key:
+                    return key
+        except OSError as e:
+            log(f"Could not read {API_KEY_PATH}: {e}")
+        key = self.get("openai_api_key") or ""
+        return key.strip() or None
+
+    @property
+    def api_key_source(self):
+        """Where the key came from — for the UI, without revealing the key."""
+        if os.environ.get("OPENAI_API_KEY", "").strip():
+            return "environment"
+        try:
+            if API_KEY_PATH.exists() and API_KEY_PATH.read_text(
+                    encoding="utf-8").strip():
+                return "key file"
+        except OSError:
+            pass
+        if (self.get("openai_api_key") or "").strip():
+            return "config.json"
+        return None
+
+    def write_api_key(self, key):
+        """Store the key in its own file, never in config.json."""
+        try:
+            API_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = API_KEY_PATH.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(key.strip())
+            os.replace(tmp, API_KEY_PATH)
+            try:
+                os.chmod(API_KEY_PATH, 0o600)   # no-op on Windows, right on macOS
+            except OSError:
+                pass
+            log(f"OpenAI API key written to {API_KEY_PATH}")
+            return True
+        except OSError as e:
+            log(f"Could not write the API key: {e}")
+            return False
 
     @property
     def theme(self):
