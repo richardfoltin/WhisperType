@@ -7,6 +7,8 @@ the platform-neutral UI interface that `whispertype.app.App` drives.
 This module is Windows-only. On macOS Tk activates the application on every
 window map, which would steal focus from the window we are about to type into.
 """
+import ctypes
+import ctypes.wintypes
 import os
 import threading
 import time
@@ -985,6 +987,36 @@ class TkUI:
 
     CTRL_W = 300         # every control is this wide, so the column lines up
 
+    @property
+    def settings_open(self):
+        win = getattr(self, "_settings_win", None)
+        try:
+            return win is not None and bool(win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    @staticmethod
+    def _dark_titlebar(win):
+        """Ask DWM for a dark title bar.
+
+        Tk draws the frame with the system theme, so a dark window otherwise
+        gets a white caption bar stuck on top of it. 20 is
+        DWMWA_USE_IMMERSIVE_DARK_MODE on current Windows; 19 was the attribute
+        number before build 19041, so try that as a fallback.
+        """
+        try:
+            win.update_idletasks()
+            hwnd = int(win.wm_frame(), 16)
+            on = ctypes.c_int(1)
+            for attribute in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        ctypes.wintypes.HWND(hwnd), ctypes.c_int(attribute),
+                        ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                    return True
+        except Exception as e:
+            log(f"Could not darken the title bar: {e}")
+        return False
+
     def _settings_option(self, parent, values, current, on_pick):
         """Dark dropdown in a filled shell. Returns (frame, var, repopulate).
 
@@ -1083,6 +1115,9 @@ class TkUI:
         win.title("WhisperType settings")
         win.configure(bg=C["bg"])
         win.resizable(False, False)
+        # Before the first map, so the frame is drawn dark rather than
+        # repainted from white a moment later.
+        self._dark_titlebar(win)
 
         def on_close():
             self._settings_win = None
@@ -1122,10 +1157,13 @@ class TkUI:
                          row=n, column=0, sticky="w", pady=(0, 2))
             widget.grid(row=n, column=1, sticky="w", pady=(0, 2))
             if hint:
+                # height in text lines, fixed: these labels change at runtime
+                # (the engine one especially), and letting them reflow made the
+                # whole window jump a row taller or shorter mid-click.
                 lbl = tk.Label(parent, text=hint, bg=C["bg"], fg=C["dim"],
-                               font=("Segoe UI", 8), anchor="w",
-                               justify="left", wraplength=300)
-                lbl.grid(row=n + 1, column=1, sticky="w", pady=(0, 8))
+                               font=("Segoe UI", 8), anchor="nw",
+                               justify="left", wraplength=self.CTRL_W, height=2)
+                lbl.grid(row=n + 1, column=1, sticky="w", pady=(0, 6))
                 return lbl
             tk.Frame(parent, bg=C["bg"], height=6).grid(row=n + 1, column=1)
             return None
@@ -1234,9 +1272,13 @@ class TkUI:
 
         self._refresh_settings()
         win.update_idletasks()
-        x = self.root.winfo_screenwidth() // 2 - win.winfo_reqwidth() // 2
-        y = max(60, self.root.winfo_screenheight() // 2 - win.winfo_reqheight() // 2)
-        win.geometry(f"+{max(x, 0)}+{y}")
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.root.winfo_screenwidth() // 2 - w // 2
+        y = max(60, self.root.winfo_screenheight() // 2 - h // 2)
+        # Pin the size as well as the position: with the height fixed, no
+        # amount of label text can make the window resize under the cursor.
+        win.geometry(f"{w}x{h}+{max(x, 0)}+{y}")
+        self._dark_titlebar(win)
         win.lift()
         win.focus_force()
 
@@ -1306,6 +1348,7 @@ class TkUI:
         win.configure(bg=self.C["bg"])
         win.attributes("-topmost", True)
         win.resizable(False, False)
+        self._dark_titlebar(win)
 
         source = self.app.cfg.api_key_source
         blurb = (f"A key is already set (from the {source})."
@@ -1372,13 +1415,13 @@ class TkUI:
 
         Safe from any thread: this touches no Tk, only app state and Win32.
         """
-        if not self.tray_icon:
-            return
-        # The settings window shows the same state; it has to move with it, and
-        # touching Tk has to happen on the Tk thread — refresh_tray is called
-        # from the worker.
+        # First, and before the tray_icon guard: the settings window shows the
+        # same state and has to move with it whether or not a tray icon exists.
+        # Touching Tk happens on the Tk thread — this is called from the worker.
         if getattr(self, "_settings_win", None) is not None:
             self.root.after(0, self._refresh_settings)
+        if not self.tray_icon:
+            return
         try:
             self.tray_icon.menu = self._build_tray_menu()
             self.tray_icon.icon = make_tray_icon(self._tray_state or "idle")

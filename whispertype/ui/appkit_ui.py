@@ -143,6 +143,10 @@ class AppKitUI:
     #: the shared worker can call them without platform checks.
     supports_benchmark = False
 
+    #: There is no separate settings window here — the menu bar holds the
+    #: same controls and, unlike a Win32 tray menu, stays usable.
+    settings_open = False
+
     def show_benchmark(self, job):
         pass
 

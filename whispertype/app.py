@@ -285,8 +285,12 @@ class App:
         # Redraw now, not when the switch finishes: the menu has to stop
         # showing the previous engine's models the moment the click lands.
         self.ui.refresh_tray()
-        self.ui.show_notice("Switching to "
-                            + ("OpenAI API…" if kind == "openai" else "local model…"))
+        if not getattr(self.ui, "settings_open", False):
+            # The settings window already says "Switching…" in place. Popping
+            # the overlay over it as well is just a flash of noise.
+            self.ui.show_notice("Switching to "
+                                + ("OpenAI API…" if kind == "openai"
+                                   else "local model…"))
         self.jobs.submit_control(EngineSwitch(kind))
 
     def _handle_engine_switch(self, msg):
