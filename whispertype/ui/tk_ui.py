@@ -48,6 +48,122 @@ IDLE_CHOICES = [
 ]
 
 
+class _Slider(tk.Canvas):
+    """Flat slider drawn to the app palette.
+
+    tk.Spinbox brings native Windows chrome — a hairline border and two tiny
+    grey arrows — which looks like damage on a dark panel. This is drawn, so
+    it matches, and it can carry a reference marker: for the silence
+    threshold, knowing where your microphone actually idles is the whole
+    difference between guessing at a number and setting one.
+    """
+
+    H = 30
+    PAD = 12
+    READOUT = 84          # space reserved on the right for the value
+
+    def __init__(self, parent, palette, *, lo, hi, step, value, unit,
+                 on_change, width=300, marker=None):
+        super().__init__(parent, width=width, height=self.H,
+                         bg=palette["bar_bg"], highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=True)
+        self.C = palette
+        self.lo, self.hi, self.step = lo, hi, step
+        self.unit, self.on_change, self.marker = unit, on_change, marker
+        # Deliberately not self._w — Tk stores the widget's own path there, and
+        # overwriting it breaks every subsequent Tcl call on this canvas.
+        self._track_w = width
+        self._value = self._snap(value)
+
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Left>", lambda e: self._nudge(-1))
+        self.bind("<Right>", lambda e: self._nudge(1))
+        self.bind("<FocusIn>", lambda e: self._redraw())
+        self.bind("<FocusOut>", lambda e: self._redraw())
+        self._redraw()
+
+    # ── value ↔ pixels ──
+
+    @property
+    def _x0(self):
+        return self.PAD
+
+    @property
+    def _x1(self):
+        return max(self._x0 + 10, self._track_w - self.READOUT)
+
+    def _snap(self, v):
+        v = min(max(float(v), self.lo), self.hi)
+        return round((v - self.lo) / self.step) * self.step + self.lo
+
+    def _to_x(self, v):
+        span = (self.hi - self.lo) or 1
+        return self._x0 + (self._x1 - self._x0) * (v - self.lo) / span
+
+    def _from_x(self, x):
+        span = self._x1 - self._x0 or 1
+        return self._snap(self.lo + (self.hi - self.lo) * (x - self._x0) / span)
+
+    # ── interaction ──
+
+    def _on_press(self, event):
+        self.focus_set()
+        self._set(self._from_x(event.x), commit=False)
+
+    def _on_drag(self, event):
+        self._set(self._from_x(event.x), commit=False)
+
+    def _on_release(self, _event):
+        self.on_change(self._value)
+
+    def _nudge(self, direction):
+        self._set(self._value + direction * self.step, commit=True)
+
+    def _set(self, value, commit):
+        value = self._snap(value)
+        if value != self._value:
+            self._value = value
+            self._redraw()
+        if commit:
+            self.on_change(self._value)
+
+    def set_value(self, value):
+        self._value = self._snap(value)
+        self._redraw()
+
+    def set_marker(self, marker):
+        self.marker = marker
+        self._redraw()
+
+    # ── drawing ──
+
+    def _redraw(self):
+        C = self.C
+        self.delete("all")
+        y = self.H // 2
+        x0, x1, hx = self._x0, self._x1, self._to_x(self._value)
+
+        self.create_line(x0, y, x1, y, fill=C["sep"], width=4, capstyle="round")
+        if hx > x0 + 1:
+            self.create_line(x0, y, hx, y, fill=C["bar_lo"], width=4,
+                             capstyle="round")
+
+        if self.marker is not None and self.lo <= self.marker <= self.hi:
+            mx = self._to_x(self.marker)
+            self.create_line(mx, y - 9, mx, y + 9, fill=C["bar_mid"], width=2)
+
+        r = 7
+        ring = C["bar_lo"] if self.focus_get() is self else C["text"]
+        self.create_oval(hx - r, y - r, hx + r, y + r,
+                         fill=C["bg"], outline=ring, width=2)
+
+        text = f"{self._value:g}" + (f" {self.unit}" if self.unit else "")
+        self.create_text(self._track_w - self.PAD, y, text=text, anchor="e",
+                         fill=C["text"], font=("Segoe UI", 9))
+
+
 class TkUI:
     C = {"bg": "#0f172a", "rec": "#f87171", "trans": "#fbbf24", "text": "#f1f5f9",
          "dim": "#64748b", "bar_bg": "#1e293b",
@@ -1058,37 +1174,17 @@ class TkUI:
 
         return shell, var, repopulate
 
-    def _settings_number(self, parent, value, on_apply, unit, to=60, step=0.5):
-        """Number field in the same shell as the dropdowns, with its unit.
-
-        Commits on Enter, on the spinner arrows and on leaving the field, so
-        no value can be typed and then silently lost.
-        """
-        C = self.C
-        shell = tk.Frame(parent, bg=C["bar_bg"], width=self.CTRL_W, height=28)
+    def _settings_slider(self, parent, *, lo, hi, step, value, unit,
+                         on_change, marker=None):
+        """Slider in the same shell as the dropdowns, so the column lines up."""
+        shell = tk.Frame(parent, bg=self.C["bar_bg"],
+                         width=self.CTRL_W, height=_Slider.H)
         shell.pack_propagate(False)
-
-        var = tk.StringVar(value=value)
-
-        def apply(*_a):
-            on_apply(var.get())
-        box = tk.Spinbox(shell, from_=0, to=to, increment=step, width=6,
-                         textvariable=var, command=apply,
-                         bg=C["bar_bg"], fg=C["text"],
-                         buttonbackground=C["sep"],
-                         insertbackground=C["text"],
-                         readonlybackground=C["bar_bg"],
-                         highlightthickness=0, bd=0, relief="flat",
-                         justify="right", font=("Consolas", 10))
-        box.bind("<Return>", apply)
-        box.bind("<FocusOut>", apply)
-        box.pack(side="left", padx=(10, 0), pady=4)
-        tk.Label(shell, text=unit, bg=C["bar_bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
-        note = tk.Label(shell, text="", bg=C["bar_bg"], fg=C["dim"],
-                        font=("Segoe UI", 8))
-        note.pack(side="right", padx=(0, 10))
-        return shell, var, note
+        slider = _Slider(shell, self.C, lo=lo, hi=hi, step=step, value=value,
+                         unit=unit, on_change=on_change,
+                         width=self.CTRL_W, marker=marker)
+        slider.pack(fill="both", expand=True)
+        return shell, slider
 
     def _settings_button(self, parent, text, command):
         return tk.Button(parent, text=text, command=command,
@@ -1217,20 +1313,27 @@ class TkUI:
             "The same microphone often appears more than once, over different "
             "drivers. The index picks which one is used.")
 
-        stop_box, _, _ = self._settings_number(
-            sec, f"{app.cfg.silence_duration:g}",
-            lambda v: self._apply_number("silence_duration", v),
-            "seconds", to=60, step=0.5)
+        stop_box, _ = self._settings_slider(
+            sec, lo=0, hi=15, step=0.5, value=app.cfg.silence_duration,
+            unit="s",
+            on_change=lambda v: app.set_config("silence_duration", v))
         row(sec, 2, "Stop after silence", stop_box,
             "0 disables it — then only the key ends a dictation.")
 
-        thr_box, _, floor_lbl = self._settings_number(
-            sec, f"{app.cfg.silence_threshold:g}",
-            lambda v: self._apply_number("silence_threshold", v),
-            "level", to=32768, step=25)
-        row(sec, 4, "Silence threshold", thr_box,
-            "Anything quieter counts as silence.")
-        self._set["floor_lbl"] = floor_lbl
+        # The slider covers the useful range, but a hand-edited config can sit
+        # above it; widen rather than silently clamp the value.
+        thr_now = app.cfg.silence_threshold
+        thr_max = max(2000, int((thr_now + 499) // 500) * 500)
+        thr_box, thr_slider = self._settings_slider(
+            sec, lo=0, hi=thr_max, step=25, value=thr_now, unit="",
+            on_change=lambda v: app.set_config("silence_threshold", v),
+            marker=getattr(app, "noise_floor", None))
+        # Non-empty: row() only creates the label when there is text, and
+        # _refresh_settings fills in the measured level once it is known.
+        floor_hint = row(sec, 4, "Silence threshold", thr_box,
+                         "Anything quieter counts as silence.")
+        self._set["thr_slider"] = thr_slider
+        self._set["floor_hint"] = floor_hint
 
         # ══ Memory ══
         sec = section("Memory")
@@ -1328,14 +1431,19 @@ class TkUI:
             self._set["key_state"].config(
                 text=f"set — from the {source}" if source else "not set",
                 fg=self.C["bar_lo"] if source else self.C["dim"])
-        if "floor_lbl" in self._set:
-            floor = getattr(app, "noise_floor", None)
+        floor = getattr(app, "noise_floor", None)
+        if "thr_slider" in self._set:
+            self._set["thr_slider"].set_marker(floor)
+        if "floor_hint" in self._set and self._set["floor_hint"]:
             # One decimal below 10: a noise-suppressing mic idles at 0.5, and
             # rounding that to "0" hides the very thing worth seeing.
-            self._set["floor_lbl"].config(
-                text="" if floor is None else
-                f"yours idles at {floor:.1f}" if floor < 10 else
-                f"yours idles at {floor:.0f}")
+            shown = ("" if floor is None
+                     else f"{floor:.1f}" if floor < 10 else f"{floor:.0f}")
+            self._set["floor_hint"].config(
+                text="Anything quieter counts as silence."
+                if floor is None else
+                f"Anything quieter counts as silence. The ▎mark is where your "
+                f"microphone idles: {shown}.")
 
     def ask_api_key(self):
         """Prompt for the OpenAI key. Runs on the Tk thread; the tray callback
