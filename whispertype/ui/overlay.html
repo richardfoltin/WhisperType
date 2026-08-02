@@ -211,10 +211,20 @@ html, body {
 #target:empty { display: none; }
 #gpu-chip { flex: none; margin-left: auto; color: var(--label-3); }
 
+/* ── The flexible middle ──────────────────────────────────────────────────
+   Only the mode that owns it grows; everything else stays out of the way so
+   #hint's margin-top:auto keeps the footer strip on the bottom edge. */
+#stage { flex: none; display: none; }
+#root[data-mode="recording"] #stage {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column; justify-content: center;
+  padding: 0 var(--gutter);
+}
+
 /* ── Level meter — only while recording ──────────────────────────────────── */
-#level-wrap { display: none; margin-top: var(--gap-group); }
+#level-wrap { display: none; width: 100%; }
 #root[data-mode="recording"] #level-wrap { display: block; }
-#level { display: block; width: 348px; height: 28px; }
+#level { display: block; width: 348px; height: 40px; }
 
 /* The run-up to auto-stop, replacing the red threshold tick — red means
    "error" everywhere else in this UI. */
@@ -252,8 +262,16 @@ html, body {
 
 /* ── Queue ───────────────────────────────────────────────────────────────── */
 #queue { border-top: 1px solid var(--hairline); padding-bottom: var(--gap-item); }
-.group-hdr { font: 600 11px/1 var(--font); color: var(--label-2); padding: 10px var(--gutter) 2px; }
-#queue-rows { list-style: none; }
+/* While transcribing, the queue owns the middle of the panel and centres
+   itself in it — a single row pinned under the header left the fixed panel
+   looking half-empty. */
+#root[data-mode="transcribing"] #queue {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column; justify-content: center;
+  overflow-y: auto; overscroll-behavior: contain;
+}
+.group-hdr { flex: none; font: 600 11px/1 var(--font); color: var(--label-2); padding: 10px var(--gutter) 2px; }
+#queue-rows { flex: none; list-style: none; }
 
 .q-row {
   display: flex; align-items: center; gap: var(--gap-item);
@@ -526,17 +544,22 @@ html, body {
       <span id="target"></span>
       <span id="gpu-chip" class="num hidden"></span>
     </div>
+  </section>
+
+  <!-- The flexible middle. Whatever the mode puts here is centred in the space
+       the fixed panel leaves between the header and the footer. -->
+  <div id="stage">
     <div id="level-wrap">
       <canvas id="level"></canvas>
       <div id="silence"><i></i></div>
     </div>
     <canvas id="gpu-graph"></canvas>
-  </section>
+  </div>
 
   <div id="message" class="hidden"><i class="sym"></i><span id="message-text"></span></div>
 
   <section id="queue" class="hidden">
-    <div class="group-hdr">Transcribing</div>
+    <div class="group-hdr" id="queue-hdr"></div>
     <ul id="queue-rows"></ul>
     <div id="queue-more" class="hidden"></div>
   </section>
@@ -820,6 +843,12 @@ html, body {
           () => post({ action: "cancelJob", id: it.id })));
         box.append(li);
       }
+      // Not "Transcribing" — the status header two lines up already says that.
+      const waiting = items.filter((i) => i.status !== "transcribing").length;
+      $("queue-hdr").textContent = items.length === 1
+        ? "1 recording" : `${items.length} recordings` +
+          (waiting ? ` · ${waiting} waiting` : "");
+
       const more = $("queue-more");
       more.classList.toggle("hidden", items.length <= MAX_QUEUE_VISIBLE);
       more.textContent = `+${items.length - MAX_QUEUE_VISIBLE} more`;

@@ -51,7 +51,8 @@ OV_W = 380
 #: showing a two-line error resized the window under the pointer; two stable
 #: sizes are calmer and still proportionate — a recording HUD should not be as
 #: tall as a 50-entry archive.
-OV_H_COMPACT = 212
+OV_H_COMPACT = 212      # idle / recording / notice / loading / error
+OV_H_QUEUE = 300        # transcribing: room for the five visible jobs
 OV_H_HISTORY = 470
 
 HTML_PATH = Path(__file__).with_name("overlay.html")
@@ -441,7 +442,8 @@ class AppKitUI:
         if rec_start is not None:
             state["recStart"] = int(rec_start * 1000)
         self._js(f"wt.setState({_json(state)}); wt.setMode({_json(mode)});")
-        self._set_height(OV_H_HISTORY if mode == "history" else OV_H_COMPACT)
+        self._set_height({"history": OV_H_HISTORY,
+                          "transcribing": OV_H_QUEUE}.get(mode, OV_H_COMPACT))
 
     # ── Transient states ──
 
