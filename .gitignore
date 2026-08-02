@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 voice_daemon.log
+voice_daemon.prev.log
 *.egg-info/
 dist/
 build/

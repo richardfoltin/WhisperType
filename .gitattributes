@@ -1,0 +1,5 @@
+# cmd needs CRLF to resolve labels and goto reliably, so the launchers must be
+# checked out with CRLF regardless of the user's core.autocrlf setting.
+# Everything else is left to the local git configuration.
+*.bat text eol=crlf
+*.vbs text eol=crlf

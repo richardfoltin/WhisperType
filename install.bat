@@ -88,7 +88,7 @@ echo.
 :: ── Pre-download Whisper model ─────────────────────────────────────────────
 
 echo Downloading Whisper model (large-v3-turbo)...
-echo This is ~1.5 GB and only needs to happen once.
+echo This is ~809 MB and only needs to happen once.
 echo.
 "%VENV%\Scripts\python.exe" -c "import whisper; whisper.load_model('large-v3-turbo', device='cpu')"
 if errorlevel 1 (
@@ -120,12 +120,14 @@ echo.
 
 set STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
 set SHORTCUT=%STARTUP%\WhisperType.lnk
-set PYTHONW=%VENV%\Scripts\pythonw.exe
-set SCRIPT=%~dp0whispertype.pyw
+:: Point at start_silent.vbs rather than the venv's pythonw.exe directly — the
+:: launcher re-resolves the interpreter at boot, so deleting or rebuilding
+:: .venv later does not leave a silently broken startup shortcut behind.
+set LAUNCHER=%~dp0start_silent.vbs
 
 echo Creating startup shortcut...
 powershell -NoProfile -Command ^
-  "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%PYTHONW%'; $s.Arguments = '\"%SCRIPT%\"'; $s.WorkingDirectory = '%~dp0'; $s.Description = 'WhisperType - Voice Dictation'; $s.Save()"
+  "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = 'wscript.exe'; $s.Arguments = '\"%LAUNCHER%\"'; $s.WorkingDirectory = '%~dp0'; $s.Description = 'WhisperType - Voice Dictation'; $s.Save()"
 
 if exist "%SHORTCUT%" (
     echo [OK] Startup shortcut created. WhisperType will start with Windows.

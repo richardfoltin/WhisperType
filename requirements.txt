@@ -5,4 +5,10 @@ pynput>=1.7.6
 pystray>=0.19
 Pillow>=10.0
 numpy>=1.21
+
+# NVML bindings for the GPU graph. nvidia-ml-py provides the `pynvml` module.
+# The separate, deprecated `pynvml` package installs a module of the same name
+# and the two overwrite each other — if you see
+#   FutureWarning: The pynvml package is deprecated
+# run:  pip uninstall -y pynvml  &&  pip install --force-reinstall nvidia-ml-py
 nvidia-ml-py>=12.0
