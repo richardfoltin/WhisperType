@@ -1,0 +1,531 @@
+"""Application orchestration — shared by the Windows and macOS builds.
+
+Owns the state machine (idle / recording / transcribing / history / error), the
+hotkey listener, the recording thread and the single transcription worker.
+Everything platform specific goes through `self.backend` (input synthesis,
+window targeting, GPU counter) and `self.ui` (overlay + tray).
+"""
+import threading
+import time
+
+import pynput.keyboard
+
+from . import __version__, audio, config
+from .jobs import JobQueue, JobStatus, ModelSwitch, ModelUnload, TranscriptionJob
+from . import transcribe as transcribe_mod
+from .log import log
+from .transcribe import create_engine
+
+DOUBLE_TAP_MS = 400
+GPU_WINDOW = 60          # samples kept for the sparkline (1 Hz => 60 s)
+
+KEY_MAP = {
+    "ctrl_r":  pynput.keyboard.Key.ctrl_r,
+    "ctrl_l":  pynput.keyboard.Key.ctrl_l,
+    "shift_r": pynput.keyboard.Key.shift_r,
+    "shift_l": pynput.keyboard.Key.shift_l,
+    "alt_r":   pynput.keyboard.Key.alt_r,
+    "alt_l":   pynput.keyboard.Key.alt_l,
+    "cmd_r":   pynput.keyboard.Key.cmd_r,
+    "cmd_l":   pynput.keyboard.Key.cmd_l,
+}
+
+#: How the push-to-talk key is spelled in the overlay hints and the menu.
+KEY_LABEL = {
+    "ctrl_r": "R-Ctrl", "ctrl_l": "L-Ctrl",
+    "shift_r": "R-Shift", "shift_l": "L-Shift",
+    "alt_r": "R-Alt", "alt_l": "L-Alt",
+    "cmd_r": "R-⌘", "cmd_l": "L-⌘",
+}
+
+
+class App:
+    def __init__(self, backend, ui_factory):
+        self.cfg = config.load()
+        self.backend = backend
+        self.jobs = JobQueue()
+        self.jobs.load_history()
+        self.engine = create_engine()
+        # Half precision is the right default on Turing and newer; on Pascal
+        # it can be slower than fp32, so it stays overridable.
+        if hasattr(self.engine, "fp16"):
+            self.engine.fp16 = bool(self.cfg.get("fp16", self.engine.fp16))
+            log(f"fp16={self.engine.fp16}")
+
+        self.ptt_key = KEY_MAP.get(self.cfg.ptt_key_name,
+                                   pynput.keyboard.Key.ctrl_r)
+        self.ptt_label = KEY_LABEL.get(self.cfg.ptt_key_name,
+                                       self.cfg.ptt_key_name)
+
+        self.model_name = self.cfg.get("last_model", "large-v3-turbo")
+        self.model_ready = False
+        self.model_switching = False
+
+        self.recording = False
+        self.paused = False
+        self.discard_recording = False
+        self.enter_stop = False
+        self.stop_event = threading.Event()
+        self._last_tap = 0.0
+        self.shutting_down = False
+
+        #: Last thing that went wrong, shown until acknowledged. Without this
+        #: a transcript that could not be delivered looked exactly like one
+        #: that was: the overlay just disappeared.
+        self.last_error = None
+
+        self.target = None
+        self.target_title = ""
+
+        # Our own synthetic keystrokes are visible to the global listener. A
+        # transcript containing a space would otherwise toggle history mode,
+        # and the Enter we send would stop the next recording.
+        self._suppress_keys = False
+
+        self.gpu_history = []
+        self.gpu_lock = threading.Lock()
+
+        self._last_activity = time.monotonic()
+
+        self.ui = ui_factory(self)
+        self.backend.set_own_window_provider(self.ui.own_window_ids)
+        self._listener = None
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
+    def start(self):
+        log(f"WhisperType {__version__} starting")
+
+        if self.backend.gpu_available:
+            threading.Thread(target=self._gpu_collector, daemon=True).start()
+            log(f"GPU collector started (1s interval, {GPU_WINDOW}s window)")
+
+        threading.Thread(target=self._warm_audio, daemon=True).start()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+        if self.cfg.idle_unload_seconds > 0:
+            threading.Thread(target=self._idle_watchdog, daemon=True).start()
+            log(f"Idle unload after {self.cfg.idle_unload_seconds / 60:.0f} min")
+
+        self._listener = pynput.keyboard.Listener(on_press=self._on_press)
+        self._listener.start()
+
+        log(f"PTT={self.cfg.ptt_key_name} (double-tap) | Model={self.model_name}")
+
+    def run(self):
+        self.ui.run()          # blocks on the platform main loop
+        if self._listener:
+            self._listener.stop()
+        log("Daemon stopped.")
+
+    def quit(self):
+        """Tray/overlay Exit. Lets in-flight transcriptions finish (they land
+        in history) but skips typing them, then tears the UI down."""
+        self.shutting_down = True
+        if self.recording:
+            self.recording = False
+            self.stop_event.set()
+        self.ui.stop_tray()
+
+        if self.jobs.busy():
+            self.ui.call_soon(self.ui.hide)
+
+            def _wait_and_destroy():
+                self.jobs.join()
+                self.ui.call_soon(self.ui.destroy)
+
+            threading.Thread(target=_wait_and_destroy, daemon=True).start()
+        else:
+            self.ui.call_soon(self.ui.destroy)
+
+    def _warm_audio(self):
+        try:
+            audio.warm_up(self.cfg)
+        except Exception as e:
+            # Not fatal — the real open will report it again with the overlay up.
+            log(f"Audio warm-up failed: {e}")
+
+    # ── Error surface ────────────────────────────────────────────────────
+
+    def set_error(self, message):
+        """Record a failure and make it visible. The overlay stays up until the
+        user acknowledges it or the next dictation succeeds."""
+        self.last_error = message
+        log(f"ERROR SHOWN: {message}")
+        self.ui.set_tray_state("error")
+        self.ui.refresh()
+
+    def clear_error(self):
+        if self.last_error is None:
+            return
+        self.last_error = None
+        self.ui.set_tray_state("idle")
+        self.ui.refresh()
+
+    # ── GPU sampling ─────────────────────────────────────────────────────
+
+    def _gpu_collector(self):
+        while not self.shutting_down:
+            try:
+                pct = self.backend.gpu_percent()
+                if pct is not None:
+                    with self.gpu_lock:
+                        self.gpu_history.append(pct / 100.0)
+                        if len(self.gpu_history) > GPU_WINDOW:
+                            self.gpu_history.pop(0)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    def gpu_series(self):
+        with self.gpu_lock:
+            return list(self.gpu_history)
+
+    # ── Idle memory release ──────────────────────────────────────────────
+
+    def _touch(self):
+        self._last_activity = time.monotonic()
+
+    def _idle_watchdog(self):
+        """Release the model after a configurable idle period.
+
+        Reloading from the local cache measures about a second, so holding
+        ~1.6 GB resident all day for a tool used a few times an hour is a bad
+        trade. Set idle_unload_minutes to 0 to keep it resident.
+        """
+        while not self.shutting_down:
+            time.sleep(30.0)
+            limit = self.cfg.idle_unload_seconds
+            if limit <= 0 or not self.model_ready or self.model_switching:
+                continue
+            if self.recording or self.jobs.busy():
+                continue
+            if not self.engine.loaded:
+                continue
+            if time.monotonic() - self._last_activity >= limit:
+                self.jobs.submit_control(ModelUnload())
+
+    # ── Model handling ───────────────────────────────────────────────────
+
+    def model_catalog(self):
+        return self.engine.catalog()
+
+    def request_model(self, name):
+        """Called from the tray menu. The switch is queued so it runs on the
+        worker thread, after everything already queued has been transcribed."""
+        if self.recording or self.model_switching:
+            return
+        if name == self.model_name and self.model_ready:
+            return                      # already active; re-pick a failed one
+        self.model_switching = True
+        if not self.engine.is_downloaded(name):
+            self.ui.set_tray_state("downloading")
+        else:
+            self.ui.set_tray_state("loading")
+        self.jobs.submit_control(ModelSwitch(name))
+
+    # ── Transcription worker (the only thread that touches the model) ─────
+
+    def _worker(self):
+        self.ui.set_tray_state(
+            "downloading" if not self.engine.is_downloaded(self.model_name)
+            else "loading")
+        try:
+            self.engine.load(self.model_name)
+            self.model_ready = True
+            # Once a model exists we know the tokenizer works, so this is the
+            # first point at which the prompt budget can be measured.
+            transcribe_mod.report_prompt_budget(self.cfg.language)
+            self.ui.set_tray_state("idle")
+            self.ui.call_soon(self.ui.refresh_tray)
+            log("Ready.")
+        except Exception as e:
+            self.set_error(f"Could not load {self.model_name}: {e}")
+            self.ui.call_soon(self.ui.refresh_tray)
+
+        while True:
+            item = self.jobs.take()
+            try:
+                if isinstance(item, ModelSwitch):
+                    self._handle_model_switch(item)
+                    continue
+                if isinstance(item, ModelUnload):
+                    self._handle_unload()
+                    continue
+                self._handle_job(item)
+            except Exception as e:
+                log(f"Worker error: {e}")
+            finally:
+                self.jobs.done()
+
+    def _handle_unload(self):
+        try:
+            self.engine.unload()
+            self.ui.call_soon(self.ui.refresh_tray)
+        except Exception as e:
+            log(f"Unload failed: {e}")
+
+    def _handle_model_switch(self, msg):
+        previous = self.model_name
+        try:
+            log(f"Switching model to {msg.name}...")
+            self.engine.load(msg.name)
+            self.model_name = msg.name
+            self.model_ready = True
+            # Only persist a model that actually loaded, or one bad switch
+            # would break the next launch too.
+            self.cfg.set("last_model", msg.name)
+            self.cfg.save()
+            self.clear_error()
+            self.ui.set_tray_state("idle")
+        except Exception as e:
+            self.model_name = previous
+            self.set_error(f"Could not load {msg.name}: {e}")
+        finally:
+            self.model_switching = False
+            self.ui.call_soon(self.ui.refresh_tray)
+
+    def _handle_job(self, job):
+        if job.status == JobStatus.CANCELLED:
+            log(f"Skipped cancelled job {job.job_id}")
+            return
+        entry = {
+            "ts": time.strftime("%H:%M:%S", time.localtime(job.created_at)),
+            "dur": f"{job.audio_duration:.1f}s",
+            "app": job.app_name[:8] if job.app_name else "?",
+            "window": job.window_name,
+            "text": "",
+        }
+        try:
+            self.jobs.set_status(job, JobStatus.TRANSCRIBING)
+            self.ui.call_soon(self.ui.refresh)
+            self.ui.set_tray_state("transcribing")
+
+            text = self.engine.transcribe(job.audio_bytes, self.cfg.language)
+            self._touch()
+            log(f"Transcribed (job {job.job_id}, target={job.window_name}): {text}")
+
+            if not text:
+                return
+            entry["text"] = text
+            self.jobs.add_history(entry)
+
+            if self.shutting_down:
+                log(f"Shutdown: kept job {job.job_id} in history, not typing")
+            elif job.status == JobStatus.CANCELLED:
+                log(f"Job {job.job_id} cancelled during transcription — history only")
+            else:
+                self._deliver(text, job)
+        except Exception as e:
+            # Record the failure in history too, so the user at least sees that
+            # a clip was lost and when.
+            entry["text"] = f"[transcription failed: {e}]"
+            self.jobs.add_history(entry)
+            self.set_error(f"Transcription failed: {e}")
+        finally:
+            self.jobs.finish(job)
+            self.ui.call_soon(self.ui.refresh)
+            self.ui.call_later(100, self.ui.check_hide)
+            if not self.jobs.busy() and not self.recording:
+                self.ui.set_tray_state("error" if self.last_error else "idle")
+
+    def _deliver(self, text, job):
+        if job.target is None:
+            # No captured target means we do not know where this belongs.
+            # Typing into whatever happens to be in front would drop a
+            # transcript into an unrelated document.
+            self.set_error("No target window was captured — "
+                           "text saved to history (Space)")
+            return
+        try:
+            activated = self.backend.activate(job.target)
+        except Exception as e:
+            log(f"activate failed: {e}")
+            activated = False
+        if not activated:
+            self.set_error(
+                f"{job.app_name or 'The target window'} is gone — "
+                f"text saved to history (Space)")
+            return
+        self._suppress_keys = True
+        try:
+            self.backend.type_text(text)
+            if job.send_enter:
+                time.sleep(0.05)
+                self.backend.send_enter()
+                log(f"Sent Enter after transcription (job {job.job_id})")
+            self.clear_error()
+        except PermissionError as e:
+            self.set_error(f"{e} — text saved to history (Space)")
+        except Exception as e:
+            self.set_error(f"Could not type the text ({e}) — saved to history")
+        finally:
+            # Let the last synthetic events drain past the listener.
+            time.sleep(0.15)
+            self._suppress_keys = False
+
+    # ── Recording ────────────────────────────────────────────────────────
+
+    def start_recording(self, capture_target=True):
+        if self.recording or self.paused:
+            return
+        if not self.model_ready:
+            self.ui.call_soon(lambda: self.ui.show_loading(self.model_name))
+            return
+        self._touch()
+        self.recording = True
+        self.discard_recording = False
+        self.enter_stop = False
+        self.stop_event = threading.Event()
+        if capture_target:
+            try:
+                self.target = self.backend.capture_target()
+                self.target_title = self.backend.target_title(self.target)
+            except Exception as e:
+                log(f"Could not capture target window: {e}")
+                self.target, self.target_title = None, ""
+        name = self.target_title
+        self.ui.call_soon(lambda: self.ui.show_recording(name))
+        threading.Thread(target=self._record_and_enqueue, daemon=True).start()
+        log(f"Recording started, target: {name or '(none)'}")
+
+    def stop_recording(self, discard=False, send_enter=False):
+        if not self.recording:
+            return
+        self.recording = False
+        self.discard_recording = discard
+        self.enter_stop = send_enter
+        self.stop_event.set()
+
+    def _record_and_enqueue(self):
+        try:
+            capture = audio.record_until_stop(
+                self.cfg, self.stop_event,
+                level_callback=self.ui.push_level,
+                on_first_chunk=self.ui.on_capture_started)
+            data = capture.data
+            target = self.target
+            window_name = self.target_title
+            self.recording = False
+            self._touch()
+
+            if not data or self.discard_recording:
+                self.discard_recording = False
+                self.enter_stop = False
+                if not self.ui.history_mode:
+                    self.ui.call_soon(self.ui.on_recording_stopped)
+                log("Recording discarded" if data else "No audio captured")
+                return
+
+            # A clip with no speech in it is not silence to be transcribed —
+            # Whisper reliably invents a stock phrase for silence, and that
+            # phrase would be typed into whatever the user is working on.
+            if capture.speech_seconds < self.cfg.min_speech_seconds:
+                self.enter_stop = False
+                log(f"Nothing heard ({capture.speech_seconds:.2f}s above "
+                    f"threshold) — clip dropped")
+                self.ui.call_soon(lambda: self.ui.show_notice("Nothing heard"))
+                return
+
+            duration = len(data) / (self.cfg.rate * 2)   # 16-bit mono
+            try:
+                app_name = self.backend.target_app(target) if target is not None else "?"
+            except Exception:
+                app_name = "?"
+
+            send_enter = self.enter_stop
+            self.enter_stop = False
+            job = TranscriptionJob(
+                job_id=self.jobs.next_id(),
+                audio_bytes=data,
+                target=target,
+                window_name=window_name,
+                app_name=app_name,
+                audio_duration=duration,
+                send_enter=send_enter,
+            )
+
+            # Schedule the overlay update before queuing, so a very fast worker
+            # cannot clear the job before the UI has processed the transition.
+            self.ui.call_soon(self.ui.on_recording_stopped)
+            self.jobs.submit(job)
+            log(f"Enqueued job {job.job_id} for '{window_name}' ({duration:.1f}s)")
+            self.ui.set_tray_state("transcribing")
+        except Exception as e:
+            self.recording = False
+            self.set_error(f"Recording failed: {e}")
+            self.ui.call_soon(self.ui.on_recording_stopped)
+
+    # ── History mode ─────────────────────────────────────────────────────
+
+    def toggle_history(self):
+        """Show or hide the history list.
+
+        Leaving history deliberately does NOT start a recording any more: with
+        the overlay up, every Space pressed in another app used to alternate
+        start/discard, and one of those phantom clips would eventually be
+        transcribed into the user's document.
+        """
+        self.ui.set_history_mode(not self.ui.history_mode)
+
+    def show_history(self):
+        if self.recording:
+            self.stop_recording(discard=True)
+        self.ui.call_soon(lambda: self.ui.set_history_mode(True))
+
+    def cancel_job(self, job):
+        self.jobs.cancel(job)
+        log(f"Cancelled job {job.job_id}")
+        self.ui.refresh()
+
+    def set_paused(self, paused):
+        self.paused = paused
+        if paused and self.recording:
+            self.stop_recording(discard=True)
+        self.ui.set_tray_state("paused" if paused else "idle")
+        self.ui.call_soon(self.ui.refresh_tray)
+        log(f"Dictation {'paused' if paused else 'resumed'}")
+
+    # ── Hotkeys ──────────────────────────────────────────────────────────
+
+    def _on_press(self, key):
+        try:
+            self._handle_key(key)
+        except Exception as e:
+            log(f"Hotkey error: {e}")
+
+    def _handle_key(self, key):
+        if self._suppress_keys:
+            return
+        K = pynput.keyboard.Key
+
+        # Scoped to the states where the user is actually interacting with the
+        # overlay. Gating on "overlay visible" meant every space bar pressed in
+        # another app during a transcription toggled history mode.
+        if key == K.space and (self.recording or self.ui.history_mode):
+            self.ui.call_soon(self.toggle_history)
+            return
+
+        if key == K.esc and self.ui.visible:
+            if self.recording:
+                self.stop_recording(discard=True)
+            self.clear_error()
+            self.ui.call_soon(self.ui.hide)
+            return
+
+        if key == K.enter and self.recording:
+            self.stop_recording(send_enter=True)
+            log("Recording stopped by Enter (will send Enter after transcription)")
+            return
+
+        if key != self.ptt_key or self.model_switching or self.paused:
+            return
+
+        now = time.time()
+        if self.recording:
+            self.stop_recording()
+            log("Recording stopped by keypress")
+        else:
+            if (now - self._last_tap) * 1000 < DOUBLE_TAP_MS:
+                self.start_recording()
+            self._last_tap = now

@@ -1,12 +1,21 @@
 # WhisperType
 
-**Push-to-talk voice dictation for Windows — powered by OpenAI Whisper, runs 100% locally on your GPU.**
+**Push-to-talk voice dictation for Windows and macOS — powered by OpenAI Whisper, runs 100% locally on your GPU.**
 
 No cloud. No API keys. No subscriptions. Your voice never leaves your machine.
+
+| | Windows | macOS (Apple Silicon) |
+|---|---|---|
+| Engine | openai-whisper on CUDA | mlx-whisper on Metal |
+| Hotkey | Right Ctrl (double-tap) | Right Command (double-tap) |
+| Lives in | System tray | Menu bar |
+| Autostart | Startup shortcut | LaunchAgent |
 
 ---
 
 ## Quick Start
+
+### Windows
 
 ```
 git clone https://github.com/richardfoltin/WhisperType.git
@@ -18,6 +27,38 @@ That's it. The installer sets up everything: Python environment, CUDA-accelerate
 
 After installation, run `start.bat` or just restart your PC — WhisperType will be waiting in the system tray.
 
+### macOS
+
+```
+git clone https://github.com/richardfoltin/WhisperType.git
+cd WhisperType
+./install_mac.sh
+```
+
+The installer creates a virtualenv in `~/.whispertype/venv`, installs the MLX stack, downloads the model, builds a small `WhisperType.app` into `~/Applications`, and registers a LaunchAgent so it starts at login.
+
+**Then grant three permissions** in System Settings ▸ Privacy & Security — WhisperType cannot work without them, and macOS gives no error when they are missing:
+
+| Permission | Why |
+|---|---|
+| Microphone | recording (prompted automatically) |
+| Accessibility | typing the transcript into other apps |
+| Input Monitoring | the push-to-talk hotkey |
+
+Missing grants are written to `voice_daemon.log` on every startup.
+
+To update, pull and re-run the installer — it is safe to run any time:
+
+```bash
+git pull && ./install_mac.sh
+```
+
+To remove everything it created:
+
+```bash
+./uninstall_mac.sh
+```
+
 ---
 
 ## How to Use
@@ -27,13 +68,14 @@ After installation, run `start.bat` or just restart your PC — WhisperType will
 | Start recording | **Double-tap Right Ctrl** (within 400ms) |
 | Stop recording | **Right Ctrl** (single tap) |
 | Stop recording **and press Enter** in the target app | **Enter** (while recording) |
-| Auto-stop | 3 seconds of silence |
-| Open history (a recording in progress is still transcribed) | **Space** |
-| Resume recording | **Space** (while in history) |
-| Minimize to tray (discards a recording in progress) | **Esc** |
-| Switch model | Right-click tray icon > Model |
-| Show history | Right-click tray icon > Show history |
-| Exit | Right-click tray icon > Exit |
+| Auto-stop | `silence_duration` seconds of silence (default 3, `0` disables it) |
+| Open history | **Space** (while recording), or the tray / menu bar |
+| Leave history | **Space** |
+| Hide overlay (discards a recording in progress) | **Esc** |
+| Switch model | Tray / menu bar ▸ Model |
+| Exit | Tray / menu bar ▸ Exit |
+
+Space and Esc are only intercepted while you are actually recording or in history — they behave normally in your other apps the rest of the time, including while a transcription is still running.
 
 1. Double-tap **Right Ctrl** to start recording — a floating overlay appears
 2. Speak naturally
@@ -158,6 +200,38 @@ Check `voice_daemon.log` after editing the file. A comma-separated word list use
 
 ---
 
+## The menu bar (macOS)
+
+Everything you need day to day is in the menu-bar menu, so you never have to
+edit JSON for the common cases:
+
+| Item | Notes |
+|---|---|
+| **History…** | Opens the history list without starting a recording |
+| **Pause dictation** | Ignores the hotkey until you switch it back; the icon shows a struck-through mic |
+| **Model** | Runtime switch. `↓` means not downloaded yet |
+| **Language** | Takes effect on the very next dictation, no restart |
+| **Microphone** | Same. Pin the built-in mic here so recording does not drop AirPods into call quality |
+| **Open Log** | Opens `voice_daemon.log` in Console |
+| **Restart WhisperType** | Needed only after changing the hotkey |
+
+The icon colour is the app's status at a glance: green ready, red recording,
+amber transcribing, grey downloading or loading, **red exclamation mark** when
+something failed, struck-through when paused.
+
+## When something goes wrong
+
+A transcript that cannot be delivered is never silently dropped. The overlay
+stays on screen with the reason, the menu-bar icon turns into a red exclamation
+mark, and the text is kept in history so you can copy it. Press **Esc** to
+dismiss. This covers: the target app quit, a password field took secure input,
+the Accessibility permission was revoked, the microphone was unavailable, the
+model failed to load, or transcription itself threw.
+
+History is written to `~/.whispertype/history.json`, so it survives quitting and
+logging out — which matters precisely because it is where undeliverable text
+ends up.
+
 ## Model Switching
 
 Right-click the tray icon and go to **Model** to see all available Whisper models:
@@ -183,35 +257,64 @@ For daily use, **`large-v3-turbo`** is the best balance of speed and accuracy.
 
 ## Configuration
 
-Edit `%USERPROFILE%\.whispertype\config.json`:
+Edit `%USERPROFILE%\.whispertype\config.json` (Windows) or `~/.whispertype/config.json` (macOS):
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `push_to_talk_key` | `"ctrl_r"` | Hotkey. Options: `ctrl_r`, `ctrl_l`, `shift_r`, `shift_l`, `alt_r`, `alt_l` |
-| `whisper_model` | `"large-v3-turbo"` | Model to start with |
+| `push_to_talk_key` | `"ctrl_r"` / `"cmd_r"` | Hotkey. Options: `ctrl_r`, `ctrl_l`, `shift_r`, `shift_l`, `alt_r`, `alt_l`, `cmd_r`, `cmd_l`. macOS defaults to `cmd_r` because Apple keyboards have no right Ctrl. |
+| `input_device` | *(system default)* | Device index, or a substring of its name. On macOS, e.g. `"MacBook Air Microphone"` to stop recording from switching AirPods into low-quality call mode. On Windows the same physical mic is often exposed several times over different host APIs and the system default is not always the one carrying signal — the startup log prints the idle noise floor so you can tell. |
 | `language` | `"en"` | Whisper language code (`en`, `hu`, `de`, `fr`, `es`, `ja`, etc.) |
 | `silence_threshold` | `200` | Audio level below this = silence (0-32768) |
-| `silence_duration` | `3.0` | Seconds of silence before auto-stop |
+| `silence_duration` | `3.0` | Seconds of silence before auto-stop. `0` disables it — end every dictation with the key instead |
 | `max_recording_time` | `300.0` | Maximum recording length in seconds |
 | `sample_rate` | `16000` | Capture rate. Whisper expects 16 kHz — leave it alone |
-| `chunk_size` | `1024` | PyAudio frames per read |
-| `fp16` | `true` on GPU | Half-precision inference. Forced off on CPU |
-| `last_model` | *(written by the app)* | Model chosen from the tray menu; overrides `whisper_model` |
+| `chunk_size` | `1024` | Frames per read |
+| `fp16` | `true` on GPU | Half-precision inference (Windows/CUDA). Forced off on CPU |
+| `min_speech_seconds` | `0.25` | A clip with less speech than this is discarded instead of transcribed. Whisper reliably invents a sentence for silence, and an accidental double-tap would otherwise type it into your document. |
+| `idle_unload_minutes` | `10` | Release the model after this many idle minutes (`0` = keep it resident). Measured: 1799 MB → 260 MB, and reloading from the local cache takes about a second. |
+| `theme` | `"auto"` | Overlay appearance: `auto` follows the system, or pin it with `dark` / `light`. |
+| `last_model` | *(written by the app)* | Model chosen from the tray / menu bar |
 
 Unrecognised keys are listed in `voice_daemon.log` at startup, so a typo shows up instead of silently doing nothing.
 
-**About `fp16`:** half precision is the right default on Turing and newer (RTX 20xx+). Pascal cards (GTX 10xx, `sm_61`) run fp16 math at 1/64 rate, so fp32 can be faster there. The log prints your GPU's compute capability at startup; use Benchmark mode to compare.
+**If recordings cut themselves off mid-sentence**, it is the silence auto-stop firing on a thinking pause. Every capture now logs why it ended:
 
-If `config.json` is missing or corrupt, WhisperType falls back to `config.template.json` and then to built-in defaults, rather than dying invisibly.
+```
+Capture: 7.2s, speech 4.1s, peak RMS 4820 (threshold 200), ended by silence
+  Auto-stopped after 3.0s below the threshold. Raise "silence_duration" if you
+  pause longer than that while thinking, or set it to 0 and always stop with the key.
+```
+
+Microphones with aggressive noise suppression output *exact* digital zero between words, so a pause has no room tone to keep the counter from advancing — the startup log prints the idle noise floor so you can see whether that is your situation. If the peak never exceeds the threshold at all, the log says so too, and the cause is the wrong `input_device` or a `silence_threshold` set above your voice.
+
+**About `fp16`:** half precision is the right default on Turing and newer (RTX 20xx+). Pascal cards (GTX 10xx, `sm_61`) run fp16 math at 1/64 rate, so fp32 can be faster there. The log prints your GPU's compute capability at startup.
+
+If `config.json` is missing it is created from the defaults. If it exists but cannot be parsed, WhisperType runs on defaults and **leaves your file alone** — one stray comma must not cost you your settings, so nothing writes over a config it could not read.
+
+Everything except `push_to_talk_key` takes effect on the next dictation — `language` and `input_device` are re-read per job, so the menu-bar submenus change them with no restart at all. The hotkey is read once at startup, so changing it needs (macOS):
+
+```bash
+launchctl kickstart -k gui/$UID/com.whispertype.agent
+```
 
 ---
 
 ## Requirements
 
-- **Windows 10 or 11**
-- **Python 3.10+** — [python.org](https://python.org) (check "Add to PATH" during install)
-- **NVIDIA GPU recommended** — any CUDA-capable GPU; CPU works but is much slower
-- **Microphone**
+**Windows**
+
+- Windows 10 or 11
+- Python 3.10+ — [python.org](https://python.org) (check "Add to PATH" during install)
+- NVIDIA GPU recommended — any CUDA-capable GPU; CPU works but is much slower
+- Microphone
+
+**macOS**
+
+- macOS 13+ on Apple Silicon (M1 or newer)
+- Python 3.11+ from [python.org](https://python.org) — the system `python3` is 3.9 and too old for PyObjC. `install_mac.sh` downloads the installer for you if it is missing.
+- Microphone
+
+Intel Macs are not supported: the transcription backend is MLX, which is Apple-Silicon only.
 
 ---
 
@@ -262,23 +365,54 @@ Run `start_debug.bat` to see console output. Check `voice_daemon.log` for errors
 | `FutureWarning: pynvml is deprecated` | Both `pynvml` and `nvidia-ml-py` are installed. `pip uninstall -y pynvml && pip install --force-reinstall nvidia-ml-py` |
 | Console window flash | Use `start_silent.vbs` instead of `start.bat` (the installer's startup shortcut already does this) |
 
+### macOS
+
+| Problem | Solution |
+|---------|----------|
+| Hotkey does nothing | Input Monitoring is not granted. System Settings ▸ Privacy & Security ▸ Input Monitoring ▸ enable WhisperType. |
+| Overlay appears but no text is typed | Accessibility is not granted. macOS drops synthetic keystrokes silently — there is no error. Check `voice_daemon.log`. |
+| Nothing typed into a password field | Expected. macOS secure input blocks synthetic keystrokes; the transcript stays in history so you can copy it. |
+| Permissions keep resetting | Re-run `./install_mac.sh`; the bundle is ad-hoc signed with a fixed identifier so grants survive rebuilds. |
+| Music quality drops when recording | Your AirPods are the input device. Set `input_device` in the config to the built-in mic. |
+| Stop it running at login | `launchctl bootout gui/$UID/com.whispertype.agent && rm ~/Library/LaunchAgents/com.whispertype.agent.plist` |
+
 ---
 
 ## Files
 
 ```
 WhisperType/
-  whispertype.pyw       Main application (runs as background daemon)
-  install.bat           One-click installer
-  start.bat             Launch script (no console window)
-  start_silent.vbs      Launch script (no console at all, used by startup shortcut)
-  start_debug.bat       Launch with console output for debugging
-  config.template.json  Default configuration template
-  initial_prompt.md     Vocabulary bias fed to Whisper (223-token budget)
-  requirements.txt      Python dependencies
-  voice_daemon.log      Runtime log (created on each launch)
-  voice_daemon.prev.log Previous run's log
+  whispertype/              The application
+    app.py                  State machine, hotkeys, recording, queue worker
+    config.py  jobs.py       Config, transcription queue + history
+    audio.py                 Capture (PyAudio on Windows, sounddevice on macOS)
+    transcribe.py            Whisper backends (CUDA / MLX)
+    backends/windows.py      Win32 SendInput, HWND targeting, NVML
+    backends/macos.py        CGEvent typing, NSWorkspace/AX targeting
+    backends/mac_gpu.py      Apple GPU utilisation via IOKit
+    ui/tk_ui.py              Windows overlay + tray (tkinter, pystray)
+    ui/appkit_ui.py          macOS overlay + menu bar (NSPanel, WKWebView)
+    ui/overlay.html          macOS overlay markup
+    singleton.py             Single-instance guard (mutex / lock file)
+  whispertype.pyw           Windows launcher (pythonw, no console)
+  main.py                   macOS launcher (used by the .app bundle)
+  start.bat                 Windows launch script
+  start_silent.vbs          Windows launch script (no console at all)
+  start_debug.bat           Windows launch with console output
+  install.bat               Windows installer
+  install_mac.sh            macOS installer (also the updater)
+  uninstall_mac.sh          macOS uninstaller
+  setup_mac.py              py2app bundle definition
+  config.template.json      Default configuration template
+  initial_prompt.md         Vocabulary bias fed to Whisper (223-token budget)
+  requirements.txt          Windows dependencies
+  requirements-mac.txt      macOS dependencies
+  voice_daemon.log          Runtime log (rolls over at 1 MB, keeps one backup)
 ```
+
+State lives in `~/.whispertype/`: `config.json`, `history.json` and the venv.
+
+The overlay is rebuilt from scratch on macOS rather than shared. Tk cannot be used there: its `XMapWindow` calls `[NSApp activateIgnoringOtherApps:]` on every window map, so the overlay would steal focus from the very window the transcript is about to be typed into.
 
 ---
 
