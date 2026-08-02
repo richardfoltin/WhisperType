@@ -200,7 +200,16 @@ WhisperType normally runs Whisper on your own machine. The tray / menu bar ▸ *
 | Works offline | yes | no |
 | Models | `large-v3-turbo` … `tiny` | `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `whisper-1`, … |
 
-The model list is fetched live from `/v1/models`, so new models appear without an update here; a built-in list is used if the request fails.
+The model list is fetched live from `/v1/models`, so new models appear without an update here; a built-in list is used if the request fails. At the time of writing that yields:
+
+| Model | Notes |
+|---|---|
+| `gpt-4o-transcribe` | the default — best general accuracy |
+| `gpt-4o-mini-transcribe` | cheaper and faster, slightly less accurate |
+| `gpt-4o-transcribe-diarize` | adds speaker labels; pointless for single-speaker dictation |
+| `whisper-1` | the original hosted Whisper; cheapest, oldest |
+
+The `gpt-realtime*` family is **not** offered. Those are websocket session models — `POST /v1/audio/transcriptions` answers `404 Invalid URL` for them — and a menu entry that silently transcribed with something else would be worse than no entry.
 
 ### The API key
 

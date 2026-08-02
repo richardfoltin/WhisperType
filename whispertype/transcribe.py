@@ -378,7 +378,13 @@ OPENAI_FALLBACK_MODELS = [
 
 #: What counts as a speech-to-text model in /v1/models. Without a filter the
 #: TTS models (tts-1*) leak into the same list.
-_OPENAI_STT_RE = re.compile(r"^(whisper-|gpt-4o.*transcribe|gpt-realtime.*)")
+#:
+#: The gpt-realtime* family is deliberately excluded: those are websocket
+#: session models, POST /v1/audio/transcriptions answers 404 "Invalid URL" for
+#: them, and offering a menu entry that silently transcribes with something
+#: else is worse than not offering it. _HTTP_FALLBACK still covers a config
+#: that names one by hand.
+_OPENAI_STT_RE = re.compile(r"^(whisper-|gpt-4o.*transcribe)")
 
 #: Dated snapshots (…-2025-12-15) are reproducibility pins of the evergreen
 #: base model; hiding them keeps the menu scannable.
