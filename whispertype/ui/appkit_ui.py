@@ -29,10 +29,12 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary, NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel, NSStatusWindowLevel,
 )
+from AppKit import NSAlert, NSAlertFirstButtonReturn, NSSecureTextField
 from Foundation import NSMakeRect, NSObject, NSOperationQueue, NSTimer
 from WebKit import WKWebView, WKWebViewConfiguration
 
 from .. import __version__
+from ..config import API_KEY_PATH
 from ..icon import png_bytes
 from ..jobs import JobStatus
 from ..log import LOG_PATH, log
@@ -40,13 +42,7 @@ from ..log import LOG_PATH, log
 OV_W = 380
 HTML_PATH = Path(__file__).with_name("overlay.html")
 
-#: Offered in the Language submenu. `language` is read fresh for every job, so
-#: switching takes effect on the next dictation with no restart.
-LANGUAGES = [
-    ("hu", "Magyar"), ("en", "English"), ("de", "Deutsch"),
-    ("fr", "Français"), ("es", "Español"), ("it", "Italiano"),
-    ("nl", "Nederlands"), ("pl", "Polski"), ("ja", "日本語"),
-]
+from .common import ENGINES, IDLE_CHOICES, LANGUAGES
 
 
 def _input_device_names():
@@ -117,6 +113,26 @@ class Bridge(NSObject):
         self._ui.app.cfg.set("input_device", None if value is None else str(value))
         self._ui.app.cfg.save()
         self._ui.refresh_tray()
+
+    def engineSelected_(self, sender):
+        self._ui.app.request_engine(str(sender.representedObject()))
+
+    def apiKeySelected_(self, sender):
+        self._ui.ask_api_key()
+
+    def idleSelected_(self, sender):
+        self._ui.app.set_idle_unload(int(sender.representedObject()))
+        self._ui.refresh_tray()
+
+    def downloadAllSelected_(self, sender):
+        self._ui.app.download_all_models()
+
+    def benchmarkSelected_(self, sender):
+        self._ui.app.toggle_benchmark_next()
+        self._ui.refresh_tray()
+
+    def openBenchmarkSelected_(self, sender):
+        self._ui.app.open_last_benchmark()
 
     def historySelected_(self, sender):
         self._ui.app.show_history()
@@ -551,6 +567,18 @@ class AppKitUI:
 
         menu.addItem_(NSMenuItem.separatorItem())
 
+        local = app.engine_kind == "local"
+
+        engines = self._submenu(menu, "Engine")
+        for kind, label in ENGINES:
+            self._item(engines, label, "engineSelected:", obj=kind,
+                       state=1 if kind == app.engine_kind else 0)
+        engines.addItem_(NSMenuItem.separatorItem())
+        source = app.cfg.api_key_source
+        self._item(engines,
+                   "Set API key…" if not source else f"Replace API key ({source})…",
+                   "apiKeySelected:")
+
         models = self._submenu(menu, "Model")
         for info in app.model_catalog():
             label = f"{info.name}   {info.size_label}"
@@ -573,7 +601,27 @@ class AppKitUI:
             self._item(mics, name, "micSelected:", obj=name,
                        state=1 if current_mic and str(current_mic) in name else 0)
 
+        # Only meaningful for the local engine — the hosted models live on
+        # OpenAI's servers and there is nothing to unload or download.
+        if local:
+            idle = self._submenu(menu, "Release model when idle")
+            for minutes, label in IDLE_CHOICES:
+                self._item(idle, label, "idleSelected:", obj=minutes,
+                           state=1 if abs(app.cfg.idle_unload_seconds
+                                          - minutes * 60) < 1 else 0)
+
+            pending = any(not i.downloaded for i in app.model_catalog())
+            self._item(menu, "Download all models", "downloadAllSelected:",
+                       enabled=(pending and not app.downloading_all))
+
         menu.addItem_(NSMenuItem.separatorItem())
+        if app.benchmark_supported():
+            self._item(menu, "Benchmark next recording", "benchmarkSelected:",
+                       state=1 if app.benchmark_next else 0)
+            self._item(menu, "Open last benchmark", "openBenchmarkSelected:",
+                       enabled=app.last_benchmark is not None)
+            menu.addItem_(NSMenuItem.separatorItem())
+
         self._item(menu, "Open Log", "openLogSelected:")
         self._item(menu, "Restart WhisperType", "restartSelected:")
         menu.addItem_(NSMenuItem.separatorItem())
@@ -583,6 +631,47 @@ class AppKitUI:
         self._apply_tray_state(self._tray_state or "idle")
 
     # ── Menu actions that touch the system ──
+
+    def ask_api_key(self):
+        self.call_soon(self._ask_api_key)
+
+    def _ask_api_key(self):
+        """Prompt for the OpenAI key in a standard sheet-less NSAlert.
+
+        The app runs as an accessory with a non-activating panel and normally
+        has no key window, so it has to activate itself for the duration of the
+        modal — otherwise the secure field cannot receive keystrokes. We hide
+        again afterwards so focus goes back where the user left it.
+        """
+        source = self.app.cfg.api_key_source
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("OpenAI API key")
+        alert.setInformativeText_(
+            (f"A key is already set (from the {source}). Entering a new one "
+             f"replaces it.\n\n" if source else "No key is set yet.\n\n")
+            + f"The key is stored in {API_KEY_PATH}, readable only by you — "
+              f"never in config.json, and never inside the repository.")
+        field = NSSecureTextField.alloc().initWithFrame_(
+            NSMakeRect(0, 0, 320, 24))
+        field.setPlaceholderString_("sk-…")
+        alert.setAccessoryView_(field)
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Cancel")
+
+        self._ns.activateIgnoringOtherApps_(True)
+        alert.window().makeFirstResponder_(field)
+        clicked = alert.runModal()
+        key = str(field.stringValue()).strip()
+        self._ns.hide_(None)
+
+        if clicked != NSAlertFirstButtonReturn or not key:
+            return
+        if not key.startswith("sk-"):
+            # Cheap sanity check — a mistyped key otherwise only shows up as a
+            # 401 on the next dictation.
+            self.app.set_error("That does not look like an OpenAI key (sk-…)")
+            return
+        self.app.set_api_key(key)
 
     def open_log(self):
         subprocess.Popen(["/usr/bin/open", "-a", "Console", str(LOG_PATH)])

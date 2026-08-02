@@ -96,10 +96,20 @@ def report_prompt_budget(language):
     prompt = initial_prompt()
     if not prompt:
         return
+    # Same tokenizer, two packagings: openai-whisper on Windows, mlx-whisper on
+    # macOS. Only one of them is ever installed.
+    get_tokenizer = None
+    for module in ("whisper.tokenizer", "mlx_whisper.tokenizer"):
+        try:
+            get_tokenizer = __import__(module, fromlist=["get_tokenizer"]).get_tokenizer
+            break
+        except ImportError:
+            continue
+    if get_tokenizer is None:
+        return          # hosted API engine: no local tokenizer, nothing to say
     try:
-        import whisper.tokenizer
-        tok = whisper.tokenizer.get_tokenizer(
-            multilingual=True, language=language, task="transcribe")
+        tok = get_tokenizer(multilingual=True, language=language,
+                            task="transcribe")
         toks = tok.encode(" " + prompt)
     except Exception as e:
         log(f"Could not measure the initial prompt ({e})")
