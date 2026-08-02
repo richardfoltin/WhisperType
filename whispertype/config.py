@@ -43,9 +43,12 @@ DEFAULTS = {
 
 
 class Config:
-    def __init__(self, data, path=CONFIG_PATH, writable=True):
+    def __init__(self, data, path=None, writable=True):
         self._data = data
-        self._path = path
+        # Resolved at call time, not bound as a default argument: a default
+        # would capture CONFIG_PATH at import and keep writing to the real
+        # config even when a caller (or a test) points the module elsewhere.
+        self._path = Path(path) if path else CONFIG_PATH
         #: False when the file on disk exists but could not be parsed. The
         #: in-memory config is then defaults, not the user's settings, and
         #: writing it back would finish destroying a file that one stray comma

@@ -459,6 +459,14 @@ class TkUI:
             self._benchmark_view_job = None
             self._cancel_timer_blink()
             self._rebuild_history()
+        elif self.app.recording:
+            # Space does not stop the recording, it only borrows the overlay.
+            # Coming back has to restore the timer, the blinking dot and the
+            # level meter, or the recording carries on with nothing on screen
+            # to say so.
+            self._level_tick()
+            self._tick()
+            self._blink()
         self._repack()
         h = self._calc_height()
         self.root.geometry(f"{OV_W}x{h}{self._get_pos()}")
