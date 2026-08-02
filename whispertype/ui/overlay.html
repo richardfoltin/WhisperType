@@ -1,0 +1,435 @@
+<style>
+  :root {
+    --bg:      #0f172a;
+    --rec:     #f87171;
+    --trans:   #fbbf24;
+    --text:    #f1f5f9;
+    --dim:     #64748b;
+    --bar-bg:  #1e293b;
+    --bar-lo:  #6ee7b7;
+    --bar-mid: #fbbf24;
+    --bar-hi:  #f87171;
+    --gpu-fill:#1a3a2a;
+    --sep:     #334155;
+    --danger:  #ef4444;
+    --sans: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 11px;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+    overflow: hidden;
+  }
+
+  #root { width: 380px; }
+
+  /* ── Title bar ── */
+  #titlebar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 10px 0 10px;
+    cursor: grab;
+  }
+  #titlebar.dragging { cursor: grabbing; }
+  #title { color: var(--dim); font-size: 11px; }
+  #close {
+    color: var(--dim); font-size: 15px; line-height: 1;
+    cursor: pointer; padding: 0 2px;
+  }
+  #close:hover { color: var(--text); }
+
+  .sep { height: 1px; background: var(--sep); margin: 2px 14px 6px 14px; }
+
+  /* ── GPU section ── */
+  #gpu { padding: 4px 14px; }
+  #gpu-hdr { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 2px; }
+  #gpu-label { color: var(--dim); font-size: 11px; font-weight: 600; }
+  #gpu-pct { color: var(--bar-lo); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+  #gpu-canvas { display: block; width: 352px; height: 40px; background: var(--bar-bg); }
+
+  /* ── Recording section ── */
+  #rec { padding: 0 14px; }
+  #rec-hdr { display: flex; align-items: center; padding-bottom: 4px; }
+  #dot { color: var(--rec); font-size: 14px; line-height: 1; transition: opacity .12s; }
+  #state { font-size: 14px; font-weight: 700; margin-left: 4px; }
+  #timer { margin-left: auto; color: var(--dim); font-family: var(--mono); font-size: 14px; }
+  #info { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; }
+  #level-canvas { display: block; width: 352px; height: 24px; margin: 4px 0 2px 0; }
+  #hint { color: var(--dim); font-size: 11px; padding: 2px 0 6px 0; }
+
+  /* ── Tables (queue + history) ── */
+  .table { padding: 0 14px 6px 14px; }
+  .thead, .row {
+    display: grid;
+    grid-template-columns: 66px 42px 62px 1fr auto;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    height: 22px;
+  }
+  .thead { color: var(--dim); }
+  .row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.waiting { color: var(--dim); }
+  .row.transcribing { color: var(--trans); }
+  .row.hist { color: var(--dim); }
+
+  .btns { display: flex; align-items: center; gap: 6px; padding-left: 6px; }
+  .btn { cursor: pointer; line-height: 1; }
+  .btn.copy { color: var(--bar-lo); font-size: 13px; }
+  .btn.del { color: var(--danger); font-size: 14px; font-weight: 700; }
+  .btn:hover { filter: brightness(1.35); }
+
+  #queue-more { color: var(--dim); font-family: var(--mono); font-size: 11px; height: 18px; }
+
+  #hist-scroll { max-height: 176px; overflow-y: auto; overflow-x: hidden; }
+  #hist-scroll::-webkit-scrollbar { width: 6px; }
+  #hist-scroll::-webkit-scrollbar-thumb { background: var(--sep); border-radius: 3px; }
+  #hist-empty { color: var(--dim); font-size: 11px; height: 22px; line-height: 22px; }
+
+  /* ── Tooltip ── */
+  #tooltip {
+    position: fixed; z-index: 99; display: none;
+    max-width: 340px; background: var(--bar-bg); color: var(--text);
+    font-size: 12px; line-height: 1.35; padding: 4px 8px;
+    border: 1px solid var(--sep); border-radius: 4px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  .hidden { display: none !important; }
+</style>
+
+<div id="root">
+  <div id="titlebar">
+    <span id="title">WhisperType</span>
+    <span id="close">&times;</span>
+  </div>
+
+  <section id="gpu" class="hidden">
+    <div id="gpu-hdr">
+      <span id="gpu-label">GPU</span>
+      <span id="gpu-pct">--%</span>
+    </div>
+    <canvas id="gpu-canvas" width="704" height="80"></canvas>
+  </section>
+
+  <section id="rec">
+    <div class="sep" id="rec-sep"></div>
+    <div id="rec-hdr">
+      <span id="dot">&#9679;</span>
+      <span id="state">Ready</span>
+      <span id="timer"></span>
+    </div>
+    <div id="info">
+      <span id="model"></span>
+      <span id="target"></span>
+    </div>
+    <canvas id="level-canvas" width="704" height="48"></canvas>
+    <div id="hint"></div>
+  </section>
+
+  <section id="queue" class="table hidden">
+    <div class="sep"></div>
+    <div class="thead">
+      <span>TIME</span><span>DUR</span><span>APP</span><span>WINDOW</span><span></span>
+    </div>
+    <div id="queue-rows"></div>
+    <div id="queue-more" class="hidden"></div>
+  </section>
+
+  <section id="history" class="table hidden">
+    <div class="sep"></div>
+    <div class="thead">
+      <span>TIME</span><span>DUR</span><span>APP</span><span>WINDOW</span><span></span>
+    </div>
+    <div id="hist-scroll"><div id="hist-rows"></div></div>
+  </section>
+</div>
+
+<div id="tooltip"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const post = (msg) => {
+    try { window.webkit.messageHandlers.wt.postMessage(msg); } catch (e) {}
+  };
+
+  const C = {
+    barBg: "#1e293b", barLo: "#6ee7b7", barMid: "#fbbf24", barHi: "#f87171",
+    gpuFill: "#1a3a2a", grid: "#1e293b", danger: "#ef4444", bg: "#0f172a",
+    dim: "#64748b", text: "#f1f5f9", rec: "#f87171", trans: "#fbbf24",
+  };
+
+  const DPR = 2;                 // canvases are declared at 2x
+  const GPU_WINDOW = 60;         // samples the graph is scaled against
+  const MAX_QUEUE_VISIBLE = 5;
+
+  let state = {
+    mode: "idle", model: "", target: "", hint: "",
+    gpuAvailable: false, gpuLabel: "GPU", recStart: 0,
+  };
+  let gpuSeries = [];
+  let level = 0, levelMax = 4000, levelThreshold = 200;
+
+  // ── Rendering helpers ──────────────────────────────────────────────────
+
+  function ctxOf(canvas) {
+    const c = canvas.getContext("2d");
+    c.setTransform(DPR, 0, 0, DPR, 0, 0);
+    return c;
+  }
+
+  function drawGpu() {
+    const cv = $("gpu-canvas"), c = ctxOf(cv);
+    const W = cv.width / DPR, H = cv.height / DPR;
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = C.barBg; c.fillRect(0, 0, W, H);
+
+    c.strokeStyle = C.grid; c.lineWidth = 1;
+    for (const p of [0.25, 0.5, 0.75]) {
+      const y = Math.round(H * (1 - p)) + 0.5;
+      c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke();
+    }
+
+    const n = gpuSeries.length;
+    if (n < 2) return;
+
+    // Right-aligned: a partially filled window does not stretch to full width.
+    const graphW = W * (n / GPU_WINDOW);
+    const xOff = W - graphW;
+    const step = graphW / (n - 1);
+    const pts = gpuSeries.map((v, i) => [xOff + i * step, H * (1 - v)]);
+
+    c.fillStyle = C.gpuFill;
+    c.beginPath();
+    c.moveTo(xOff, H);
+    for (const [x, y] of pts) c.lineTo(x, y);
+    c.lineTo(pts[pts.length - 1][0], H);
+    c.closePath(); c.fill();
+
+    c.strokeStyle = C.barLo; c.lineWidth = 2;
+    c.beginPath();
+    pts.forEach(([x, y], i) => (i ? c.lineTo(x, y) : c.moveTo(x, y)));
+    c.stroke();
+  }
+
+  function drawLevel() {
+    const cv = $("level-canvas"), c = ctxOf(cv);
+    const W = cv.width / DPR, H = cv.height / DPR;
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = C.barBg; c.fillRect(0, 0, W, H);
+
+    const r = Math.min(level / levelMax, 1);
+    const color = r < 0.4 ? C.barLo : (r < 0.75 ? C.barMid : C.barHi);
+    if (r > 0) { c.fillStyle = color; c.fillRect(0, 0, W * r, H); }
+
+    const sx = Math.round(W * Math.min(levelThreshold / levelMax, 1)) + 0.5;
+    c.strokeStyle = C.danger; c.lineWidth = 2;
+    c.beginPath(); c.moveTo(sx, 0); c.lineTo(sx, H); c.stroke();
+
+    c.strokeStyle = C.bg; c.lineWidth = 1;
+    for (const p of [0.25, 0.5, 0.75]) {
+      const x = Math.round(W * p) + 0.5;
+      c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke();
+    }
+  }
+
+  // ── Timer + blink (kept in JS so Python never drives per-frame work) ────
+
+  let blinkOn = true;
+  setInterval(() => {
+    if (state.mode !== "recording") return;
+    blinkOn = !blinkOn;
+    $("dot").style.opacity = blinkOn ? "1" : "0";
+  }, 500);
+
+  setInterval(() => {
+    if (state.mode !== "recording") return;
+    const e = Math.floor((Date.now() - state.recStart) / 1000);
+    $("timer").textContent = `${Math.floor(e / 60)}:${String(e % 60).padStart(2, "0")}`;
+  }, 250);
+
+  // ── Public API called from Python ──────────────────────────────────────
+
+  const api = {
+    setState(s) {
+      Object.assign(state, s);
+      const dot = $("dot"), st = $("state");
+      $("gpu").classList.toggle("hidden", !state.gpuAvailable);
+      $("gpu-label").textContent = state.gpuLabel || "GPU";
+      $("model").textContent = state.model ? `Model: ${state.model}` : "";
+      $("target").textContent = state.target ? `→ ${state.target}` : "";
+      $("hint").textContent = state.hint || "";
+
+      const M = {
+        recording:    { color: C.rec,   label: "Recording" },
+        transcribing: { color: C.trans, label: "Transcribing" },
+        history:      { color: C.barLo, label: "History" },
+        idle:         { color: C.dim,   label: "Ready" },
+      }[state.mode] || { color: C.dim, label: "Ready" };
+
+      dot.style.color = M.color;
+      dot.style.opacity = "1";
+      st.textContent = M.label;
+      st.style.color = state.mode === "recording" ? C.text : M.color;
+      if (state.mode !== "recording") $("timer").textContent = "";
+      drawLevel();
+      report();
+    },
+
+    setLevel(rms, threshold, max) {
+      level = rms;
+      if (threshold !== undefined) levelThreshold = threshold;
+      if (max !== undefined) levelMax = max;
+      drawLevel();
+    },
+
+    setGpu(series, pct) {
+      gpuSeries = series;
+      const el = $("gpu-pct");
+      if (pct === null || pct === undefined) {
+        el.textContent = "--%";
+      } else {
+        el.textContent = `${pct}%`;
+        el.style.color = pct < 50 ? C.barLo : (pct < 80 ? C.barMid : C.barHi);
+      }
+      drawGpu();
+    },
+
+    setQueue(items) {
+      const box = $("queue-rows");
+      box.textContent = "";
+      const shown = items.slice(0, MAX_QUEUE_VISIBLE);
+      for (const it of shown) {
+        const row = document.createElement("div");
+        row.className = "row " + (it.status === "transcribing" ? "transcribing" : "waiting");
+        row.append(
+          span(it.ts), span(it.dur), span(it.app), span(it.window)
+        );
+        const btns = document.createElement("span");
+        btns.className = "btns";
+        btns.append(btn("del", "×", () => post({ action: "cancelJob", id: it.id })));
+        row.append(btns);
+        box.append(row);
+      }
+      const more = $("queue-more");
+      more.classList.toggle("hidden", items.length <= MAX_QUEUE_VISIBLE);
+      more.textContent = `  +${items.length - MAX_QUEUE_VISIBLE} more…`;
+      $("queue").classList.toggle("hidden", items.length === 0 || state.mode === "history");
+      report();
+    },
+
+    setHistory(items) {
+      const box = $("hist-rows");
+      box.textContent = "";
+      if (!items.length) {
+        const e = document.createElement("div");
+        e.id = "hist-empty";
+        e.textContent = "  No transcriptions yet";
+        box.append(e);
+      }
+      // Newest first; index is into the original (oldest-first) list.
+      items.slice().reverse().forEach((it) => {
+        const row = document.createElement("div");
+        row.className = "row hist";
+        row.append(span(it.ts), span(it.dur), span(it.app), span(it.window));
+        const btns = document.createElement("span");
+        btns.className = "btns";
+        const copy = btn("copy", "\u{1F4CB}", () => post({ action: "copy", text: it.text }));
+        attachTooltip(copy, it.text.slice(0, 500) + (it.text.length > 500 ? "…" : ""));
+        btns.append(copy);
+        btns.append(btn("del", "×", () => post({ action: "deleteHistory", index: it.index })));
+        row.append(btns);
+        box.append(row);
+      });
+      report();
+    },
+
+    setMode(mode) {
+      $("history").classList.toggle("hidden", mode !== "history");
+      if (mode === "history") $("queue").classList.add("hidden");
+      report();
+    },
+  };
+
+  function span(text) {
+    const s = document.createElement("span");
+    s.textContent = text;
+    return s;
+  }
+
+  function btn(cls, text, onClick) {
+    const b = document.createElement("span");
+    b.className = "btn " + cls;
+    b.textContent = text;
+    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
+    return b;
+  }
+
+  // ── Tooltip ────────────────────────────────────────────────────────────
+
+  function attachTooltip(el, text) {
+    const tip = $("tooltip");
+    el.addEventListener("mouseenter", () => {
+      tip.textContent = text;
+      tip.style.display = "block";
+      const r = el.getBoundingClientRect();
+      const t = tip.getBoundingClientRect();
+      let y = r.top - t.height - 4;
+      if (y < 2) y = r.bottom + 4;
+      let x = Math.min(r.left, window.innerWidth - t.width - 4);
+      tip.style.left = Math.max(4, x) + "px";
+      tip.style.top = y + "px";
+    });
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  }
+
+  // ── Window dragging (WKWebView swallows the panel's own drag handling) ──
+
+  let dragging = null;
+  $("titlebar").addEventListener("mousedown", (e) => {
+    if (e.target.id === "close") return;
+    dragging = { x: e.screenX, y: e.screenY };
+    $("titlebar").classList.add("dragging");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const dx = e.screenX - dragging.x, dy = e.screenY - dragging.y;
+    if (dx || dy) {
+      dragging = { x: e.screenX, y: e.screenY };
+      post({ action: "drag", dx, dy });
+    }
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = null;
+    $("titlebar").classList.remove("dragging");
+  });
+
+  $("close").addEventListener("click", () => post({ action: "hide" }));
+
+  // ── Height reporting: Python resizes the panel to fit ──────────────────
+
+  let lastH = 0;
+  function report() {
+    requestAnimationFrame(() => {
+      const h = Math.ceil($("root").getBoundingClientRect().height);
+      if (h && h !== lastH) { lastH = h; post({ action: "height", height: h }); }
+    });
+  }
+
+  window.wt = api;
+  drawGpu();
+  drawLevel();
+  report();
+  post({ action: "ready" });
+})();
+</script>

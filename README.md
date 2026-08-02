@@ -1,12 +1,21 @@
 # WhisperType
 
-**Push-to-talk voice dictation for Windows — powered by OpenAI Whisper, runs 100% locally on your GPU.**
+**Push-to-talk voice dictation for Windows and macOS — powered by OpenAI Whisper, runs 100% locally on your GPU.**
 
 No cloud. No API keys. No subscriptions. Your voice never leaves your machine.
+
+| | Windows | macOS (Apple Silicon) |
+|---|---|---|
+| Engine | openai-whisper on CUDA | mlx-whisper on Metal |
+| Hotkey | Right Ctrl (double-tap) | Right Command (double-tap) |
+| Lives in | System tray | Menu bar |
+| Autostart | Startup shortcut | LaunchAgent |
 
 ---
 
 ## Quick Start
+
+### Windows
 
 ```
 git clone https://github.com/richardfoltin/WhisperType.git
@@ -17,6 +26,26 @@ install.bat
 That's it. The installer sets up everything: Python environment, CUDA-accelerated PyTorch, Whisper model download (~1.5 GB), config file, and a Windows Startup shortcut so it launches automatically on boot.
 
 After installation, run `start.bat` or just restart your PC — WhisperType will be waiting in the system tray.
+
+### macOS
+
+```
+git clone https://github.com/richardfoltin/WhisperType.git
+cd WhisperType
+./install_mac.sh
+```
+
+The installer creates a virtualenv in `~/.whispertype/venv`, installs the MLX stack, downloads the model, builds a small `WhisperType.app` into `~/Applications`, and registers a LaunchAgent so it starts at login.
+
+**Then grant three permissions** in System Settings ▸ Privacy & Security — WhisperType cannot work without them, and macOS gives no error when they are missing:
+
+| Permission | Why |
+|---|---|
+| Microphone | recording (prompted automatically) |
+| Accessibility | typing the transcript into other apps |
+| Input Monitoring | the push-to-talk hotkey |
+
+Missing grants are written to `voice_daemon.log` on every startup.
 
 ---
 
@@ -120,11 +149,12 @@ For daily use, **`large-v3-turbo`** is the best balance of speed and accuracy.
 
 ## Configuration
 
-Edit `%USERPROFILE%\.whispertype\config.json`:
+Edit `%USERPROFILE%\.whispertype\config.json` (Windows) or `~/.whispertype/config.json` (macOS):
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `push_to_talk_key` | `"ctrl_r"` | Hotkey. Options: `ctrl_r`, `ctrl_l`, `shift_r`, `shift_l`, `alt_r`, `alt_l` |
+| `push_to_talk_key` | `"ctrl_r"` / `"cmd_r"` | Hotkey. Options: `ctrl_r`, `ctrl_l`, `shift_r`, `shift_l`, `alt_r`, `alt_l`, `cmd_r`, `cmd_l`. macOS defaults to `cmd_r` because Apple keyboards have no right Ctrl. |
+| `input_device` | *(system default)* | macOS only. Device index, or a substring of its name — e.g. `"MacBook Air Microphone"` to stop recording from switching AirPods into low-quality call mode. |
 | `language` | `"en"` | Whisper language code (`en`, `hu`, `de`, `fr`, `es`, `ja`, etc.) |
 | `silence_threshold` | `200` | Audio level below this = silence (0-32768) |
 | `silence_duration` | `3.0` | Seconds of silence before auto-stop |
@@ -134,10 +164,20 @@ Edit `%USERPROFILE%\.whispertype\config.json`:
 
 ## Requirements
 
-- **Windows 10 or 11**
-- **Python 3.10+** — [python.org](https://python.org) (check "Add to PATH" during install)
-- **NVIDIA GPU recommended** — any CUDA-capable GPU; CPU works but is much slower
-- **Microphone**
+**Windows**
+
+- Windows 10 or 11
+- Python 3.10+ — [python.org](https://python.org) (check "Add to PATH" during install)
+- NVIDIA GPU recommended — any CUDA-capable GPU; CPU works but is much slower
+- Microphone
+
+**macOS**
+
+- macOS 13+ on Apple Silicon (M1 or newer)
+- Python 3.11+ from [python.org](https://python.org) — the system `python3` is 3.9 and too old for PyObjC. `install_mac.sh` downloads the installer for you if it is missing.
+- Microphone
+
+Intel Macs are not supported: the transcription backend is MLX, which is Apple-Silicon only.
 
 ---
 
@@ -184,21 +224,45 @@ Run `start_debug.bat` to see console output. Check `voice_daemon.log` for errors
 | Text not appearing | Some apps block simulated keystrokes. Try Notepad first to verify it works |
 | Console window flash | Use `start_silent.vbs` instead of `start.bat` (the installer's startup shortcut already does this) |
 
+### macOS
+
+| Problem | Solution |
+|---------|----------|
+| Hotkey does nothing | Input Monitoring is not granted. System Settings ▸ Privacy & Security ▸ Input Monitoring ▸ enable WhisperType. |
+| Overlay appears but no text is typed | Accessibility is not granted. macOS drops synthetic keystrokes silently — there is no error. Check `voice_daemon.log`. |
+| Nothing typed into a password field | Expected. macOS secure input blocks synthetic keystrokes; the transcript stays in history so you can copy it. |
+| Permissions keep resetting | Re-run `./install_mac.sh`; the bundle is ad-hoc signed with a fixed identifier so grants survive rebuilds. |
+| Music quality drops when recording | Your AirPods are the input device. Set `input_device` in the config to the built-in mic. |
+| Stop it running at login | `launchctl bootout gui/$UID/com.whispertype.agent && rm ~/Library/LaunchAgents/com.whispertype.agent.plist` |
+
 ---
 
 ## Files
 
 ```
 WhisperType/
-  whispertype.pyw      Main application (runs as background daemon)
-  install.bat          One-click installer
-  start.bat            Launch script (with console window)
-  start_silent.vbs     Launch script (no console window, used by startup shortcut)
-  start_debug.bat      Launch with console output for debugging
-  config.template.json Default configuration template
-  requirements.txt     Python dependencies
-  voice_daemon.log     Runtime log (created on each launch)
+  whispertype/              The application
+    app.py                  State machine, hotkeys, recording, queue worker
+    config.py  jobs.py       Config, transcription queue + history
+    audio.py                 Capture (PyAudio on Windows, sounddevice on macOS)
+    transcribe.py            Whisper backends (CUDA / MLX)
+    backends/windows.py      Win32 SendInput, HWND targeting, NVML
+    backends/macos.py        CGEvent typing, NSWorkspace/AX targeting
+    backends/mac_gpu.py      Apple GPU utilisation via IOKit
+    ui/tk_ui.py              Windows overlay + tray (tkinter, pystray)
+    ui/appkit_ui.py          macOS overlay + menu bar (NSPanel, WKWebView)
+    ui/overlay.html          macOS overlay markup
+  whispertype.pyw           Windows launcher (pythonw, no console)
+  main.py                   macOS launcher (used by the .app bundle)
+  install.bat               Windows installer
+  install_mac.sh            macOS installer
+  setup_mac.py              py2app bundle definition
+  requirements.txt          Windows dependencies
+  requirements-mac.txt      macOS dependencies
+  voice_daemon.log          Runtime log (created on each launch)
 ```
+
+The overlay is rebuilt from scratch on macOS rather than shared. Tk cannot be used there: its `XMapWindow` calls `[NSApp activateIgnoringOtherApps:]` on every window map, so the overlay would steal focus from the very window the transcript is about to be typed into.
 
 ---
 

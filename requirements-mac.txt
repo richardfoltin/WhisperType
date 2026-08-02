@@ -1,0 +1,26 @@
+# macOS (Apple Silicon) dependencies.
+#
+# Deliberately NOT here:
+#   torch / openai-whisper — openai-whisper cannot run on the torch MPS backend
+#     (aten::_sparse_coo_tensor_with_dims_and_tensors is unimplemented for
+#     SparseMPS and PYTORCH_ENABLE_MPS_FALLBACK does not cover sparse dispatch).
+#   pyaudio — needs a PortAudio build; sounddevice ships its own dylib.
+#   nvidia-ml-py — replaced by the IOKit IOAccelerator counter.
+
+mlx-whisper==0.4.3
+mlx>=0.32,<0.33
+
+sounddevice>=0.4.6
+numpy>=1.26,<2.5
+pynput>=1.7.6
+Pillow>=10.0
+
+pyobjc-core>=10.3
+pyobjc-framework-Cocoa>=10.3
+pyobjc-framework-Quartz>=10.3
+pyobjc-framework-ApplicationServices>=10.3
+pyobjc-framework-WebKit>=10.3
+
+# Builds the .app wrapper (alias mode — it does not copy the stack).
+py2app>=0.28.8
+
