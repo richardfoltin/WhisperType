@@ -84,6 +84,9 @@ class App:
 
         self.target = None
         self.target_title = ""
+        #: Idle RMS measured at startup, for the settings window. None until
+        #: the warm-up finishes.
+        self.noise_floor = None
 
         #: Benchmark mode. Armed from the tray; the next recording is run
         #: through every downloaded model instead of being typed anywhere.
@@ -157,7 +160,10 @@ class App:
 
     def _warm_audio(self):
         try:
-            audio.warm_up(self.cfg)
+            # Kept so the settings window can show the measured idle level next
+            # to the threshold — otherwise "silence_threshold: 200" is a number
+            # with nothing to compare it against.
+            self.noise_floor = audio.warm_up(self.cfg)
         except Exception as e:
             # Not fatal — the real open will report it again with the overlay up.
             log(f"Audio warm-up failed: {e}")

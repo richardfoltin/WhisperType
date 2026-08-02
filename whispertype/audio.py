@@ -211,6 +211,7 @@ def warm_up(cfg):
         stream.close()
     log(f"Audio device warm ({time.time() - t0:.2f}s) | "
         f"idle noise floor RMS {floor:.1f}, silence_threshold {cfg.silence_threshold:.0f}")
+    return floor
 
 
 def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None):

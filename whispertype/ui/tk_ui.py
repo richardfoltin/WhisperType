@@ -11,6 +11,7 @@ import os
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 
 import pystray
 
@@ -958,7 +959,6 @@ class TkUI:
                 enabled=lambda item: self.app.last_benchmark is not None,
             ),
             pystray.Menu.SEPARATOR,
-            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda icon, item: self.app.quit()),
         )
 
@@ -978,183 +978,322 @@ class TkUI:
     # settings meant opening the menu three times. A window does not have that
     # problem, and it can show everything at once.
 
+    SET_W = 460          # content width; every row lines up to this
+
     def open_settings(self):
         self.root.after(0, self._open_settings)
+
+    CTRL_W = 300         # every control is this wide, so the column lines up
+
+    def _settings_option(self, parent, values, current, on_pick):
+        """Dark dropdown in a filled shell. Returns (frame, var, repopulate).
+
+        tk.OptionMenu's own indicator is a small raised rectangle that looks
+        wrong on a dark panel, so it is switched off and replaced with a
+        chevron of our own.
+        """
+        C = self.C
+        shell = tk.Frame(parent, bg=C["bar_bg"], width=self.CTRL_W, height=28)
+        shell.pack_propagate(False)
+
+        var = tk.StringVar(value=current)
+        box = tk.OptionMenu(shell, var, *(values or ["—"]),
+                            command=lambda v: on_pick(v))
+        box.configure(bg=C["bar_bg"], fg=C["text"],
+                      activebackground=C["bar_bg"], activeforeground=C["bar_lo"],
+                      highlightthickness=0, bd=0, relief="flat",
+                      indicatoron=False, anchor="w", padx=10,
+                      font=("Segoe UI", 9), cursor="hand2",
+                      disabledforeground=C["dim"])
+        box["menu"].configure(bg=C["bar_bg"], fg=C["text"],
+                              activebackground=C["sep"], activeforeground=C["text"],
+                              bd=0, relief="flat", font=("Segoe UI", 9))
+        chevron = tk.Label(shell, text="⌄", bg=C["bar_bg"], fg=C["dim"],
+                           font=("Segoe UI", 10))
+        chevron.pack(side="right", padx=(0, 10))
+        box.pack(side="left", fill="both", expand=True)
+
+        def repopulate(new_values, new_current, enabled=True):
+            menu = box["menu"]
+            menu.delete(0, "end")
+            for v in (new_values or ["—"]):
+                menu.add_command(
+                    label=v, command=lambda value=v: (var.set(value), on_pick(value)))
+            var.set(new_current)
+            box.configure(state="normal" if enabled else "disabled",
+                          fg=C["text"] if enabled else C["dim"])
+            chevron.configure(fg=C["dim"] if enabled else C["bar_bg"])
+
+        return shell, var, repopulate
+
+    def _settings_number(self, parent, value, on_apply, unit, to=60, step=0.5):
+        """Number field in the same shell as the dropdowns, with its unit.
+
+        Commits on Enter, on the spinner arrows and on leaving the field, so
+        no value can be typed and then silently lost.
+        """
+        C = self.C
+        shell = tk.Frame(parent, bg=C["bar_bg"], width=self.CTRL_W, height=28)
+        shell.pack_propagate(False)
+
+        var = tk.StringVar(value=value)
+
+        def apply(*_a):
+            on_apply(var.get())
+        box = tk.Spinbox(shell, from_=0, to=to, increment=step, width=6,
+                         textvariable=var, command=apply,
+                         bg=C["bar_bg"], fg=C["text"],
+                         buttonbackground=C["sep"],
+                         insertbackground=C["text"],
+                         readonlybackground=C["bar_bg"],
+                         highlightthickness=0, bd=0, relief="flat",
+                         justify="right", font=("Consolas", 10))
+        box.bind("<Return>", apply)
+        box.bind("<FocusOut>", apply)
+        box.pack(side="left", padx=(10, 0), pady=4)
+        tk.Label(shell, text=unit, bg=C["bar_bg"], fg=C["dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
+        note = tk.Label(shell, text="", bg=C["bar_bg"], fg=C["dim"],
+                        font=("Segoe UI", 8))
+        note.pack(side="right", padx=(0, 10))
+        return shell, var, note
+
+    def _settings_button(self, parent, text, command):
+        return tk.Button(parent, text=text, command=command,
+                         bg=self.C["bar_bg"], fg=self.C["text"],
+                         activebackground=self.C["sep"],
+                         activeforeground=self.C["text"],
+                         bd=0, relief="flat", padx=14, pady=4,
+                         cursor="hand2", font=("Segoe UI", 9))
 
     def _open_settings(self):
         if getattr(self, "_settings_win", None) is not None:
             try:
+                self._settings_win.deiconify()
                 self._settings_win.lift()
                 self._settings_win.focus_force()
                 return
             except tk.TclError:
-                pass                       # was closed behind our back
+                pass                       # it was closed behind our back
 
         app, C = self.app, self.C
         win = tk.Toplevel(self.root)
         self._settings_win = win
+        self._set = {}                      # widgets the refresh needs
         win.title("WhisperType settings")
         win.configure(bg=C["bg"])
         win.resizable(False, False)
 
         def on_close():
             self._settings_win = None
+            self._set = {}
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.bind("<Escape>", lambda e: on_close())
 
-        row = {"n": 0}
+        body = tk.Frame(win, bg=C["bg"])
+        body.pack(fill="both", expand=True)
 
-        def label(text, hint=None):
-            tk.Label(win, text=text, bg=C["bg"], fg=C["text"],
-                     font=("Segoe UI", 9)).grid(row=row["n"], column=0,
-                                                sticky="w", padx=(16, 10), pady=6)
+        # ── Header ──
+        head = tk.Frame(body, bg=C["bg"])
+        head.pack(fill="x", padx=22, pady=(18, 0))
+        tk.Label(head, text="Settings", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI Semibold", 15)).pack(anchor="w")
+        tk.Label(head, text="Every change takes effect on your next dictation. "
+                            "Only the push-to-talk key needs a restart.",
+                 bg=C["bg"], fg=C["dim"], font=("Segoe UI", 8),
+                 justify="left", anchor="w",
+                 wraplength=self.SET_W).pack(anchor="w", fill="x", pady=(3, 0))
+
+        def section(title):
+            wrap = tk.Frame(body, bg=C["bg"])
+            wrap.pack(fill="x", padx=22, pady=(16, 0))
+            tk.Frame(wrap, bg=C["sep"], height=1).pack(fill="x", pady=(0, 10))
+            tk.Label(wrap, text=title.upper(), bg=C["bg"], fg=C["bar_lo"],
+                     font=("Segoe UI Semibold", 8)).pack(anchor="w")
+            inner = tk.Frame(wrap, bg=C["bg"])
+            inner.pack(fill="x", pady=(8, 0))
+            inner.columnconfigure(1, weight=1)
+            return inner
+
+        def row(parent, n, text, widget, hint=None):
+            tk.Label(parent, text=text, bg=C["bg"], fg=C["text"],
+                     font=("Segoe UI", 9), anchor="w", width=15).grid(
+                         row=n, column=0, sticky="w", pady=(0, 2))
+            widget.grid(row=n, column=1, sticky="w", pady=(0, 2))
             if hint:
-                tk.Label(win, text=hint, bg=C["bg"], fg=C["dim"],
-                         font=("Segoe UI", 8)).grid(row=row["n"] + 1, column=1,
-                                                    sticky="w", padx=(0, 16))
+                lbl = tk.Label(parent, text=hint, bg=C["bg"], fg=C["dim"],
+                               font=("Segoe UI", 8), anchor="w",
+                               justify="left", wraplength=300)
+                lbl.grid(row=n + 1, column=1, sticky="w", pady=(0, 8))
+                return lbl
+            tk.Frame(parent, bg=C["bg"], height=6).grid(row=n + 1, column=1)
+            return None
 
-        def place(widget, hint=None):
-            widget.grid(row=row["n"], column=1, sticky="we", padx=(0, 16), pady=6)
-            row["n"] += 1
-            if hint:
-                tk.Label(win, text=hint, bg=C["bg"], fg=C["dim"],
-                         font=("Segoe UI", 8)).grid(row=row["n"], column=1,
-                                                    sticky="w", padx=(0, 16),
-                                                    pady=(0, 4))
-                row["n"] += 1
+        # ══ Transcription ══
+        sec = section("Transcription")
 
-        def combo(values, current, on_pick, width=34):
-            var = tk.StringVar(value=current)
-            box = tk.OptionMenu(win, var, *(values or ["—"]),
-                                command=lambda v: on_pick(v))
-            box.configure(bg=C["bar_bg"], fg=C["text"], highlightthickness=0,
-                          activebackground=C["sep"], width=width, anchor="w",
-                          font=("Segoe UI", 9))
-            box["menu"].configure(bg=C["bar_bg"], fg=C["text"],
-                                  font=("Segoe UI", 9))
-            return box, var
-
-        # ── Engine ──
-        label("Engine")
+        engines = tk.Frame(sec, bg=C["bg"])
         engine_var = tk.StringVar(value=app.engine_kind)
-        engine_row = tk.Frame(win, bg=C["bg"])
-        for value, text in (("local", "Local (this machine)"), ("openai", "OpenAI API")):
-            tk.Radiobutton(engine_row, text=text, value=value, variable=engine_var,
+        for value, text in (("local", "Local"), ("openai", "OpenAI API")):
+            tk.Radiobutton(engines, text=text, value=value, variable=engine_var,
                            command=lambda: app.request_engine(engine_var.get()),
                            bg=C["bg"], fg=C["text"], selectcolor=C["bar_bg"],
                            activebackground=C["bg"], activeforeground=C["text"],
-                           font=("Segoe UI", 9)).pack(side="left", padx=(0, 14))
-        place(engine_row, "Switching reloads the model — takes a few seconds.")
+                           highlightthickness=0, bd=0,
+                           font=("Segoe UI", 9)).pack(side="left", padx=(0, 18))
+        engine_hint = row(sec, 0, "Engine", engines,
+                          "Local runs on your GPU. The API uploads the audio "
+                          "and charges per minute.")
+        self._set["engine_var"] = engine_var
+        self._set["engine_hint"] = engine_hint
 
-        # ── Model ──
-        label("Model")
         names = [m.name for m in app.model_catalog()] or [app.model_name]
-        model_box, model_var = combo(names, app.model_name, app.request_model)
-        place(model_box)
+        model_box, model_var, model_fill = self._settings_option(
+            sec, names, app.model_name, app.request_model)
+        row(sec, 2, "Model", model_box)
+        self._set["model_fill"] = model_fill
 
-        # ── Language ──
-        label("Language")
-        lang_names = [f"{name} ({code})" for code, name in LANGUAGES]
+        lang_labels = [f"{name} ({code})" for code, name in LANGUAGES]
         current_lang = next((f"{n} ({c})" for c, n in LANGUAGES
                              if c == app.cfg.language), app.cfg.language)
-        lang_box, _ = combo(lang_names, current_lang,
-                            lambda v: app.set_language(v.rsplit("(", 1)[1].rstrip(")")))
-        place(lang_box, "Read per dictation — takes effect immediately.")
+        lang_box, _, _ = self._settings_option(
+            sec, lang_labels, current_lang,
+            lambda v: app.set_language(v.rsplit("(", 1)[1].rstrip(")")))
+        row(sec, 4, "Language", lang_box)
 
-        # ── Microphone ──
-        label("Microphone")
+        # ══ Audio ══
+        sec = section("Audio")
+
         devices = audio.list_input_devices()
         dev_labels = ["System default"] + [f"[{i}] {n}" for i, n in devices]
         cur_dev = app.cfg.input_device
-        cur_label = next((f"[{i}] {n}" for i, n in devices if str(i) == str(cur_dev)),
-                         "System default")
+        cur_label = next((f"[{i}] {n}" for i, n in devices
+                          if str(i) == str(cur_dev)), "System default")
 
         def pick_device(v):
-            app.set_config("input_device",
-                           None if v == "System default"
+            app.set_config("input_device", None if v == "System default"
                            else int(v.split("]")[0].lstrip("[")))
-        dev_box, _ = combo(dev_labels, cur_label, pick_device)
-        place(dev_box, "The same mic often appears more than once — the index "
-                       "picks which path is used.")
+        dev_box, _, _ = self._settings_option(sec, dev_labels, cur_label, pick_device)
+        row(sec, 0, "Microphone", dev_box,
+            "The same microphone often appears more than once, over different "
+            "drivers. The index picks which one is used.")
 
-        # ── Silence auto-stop ──
-        label("Stop after silence")
-        sil_var = tk.StringVar(value=f"{app.cfg.silence_duration:g}")
+        stop_box, _, _ = self._settings_number(
+            sec, f"{app.cfg.silence_duration:g}",
+            lambda v: self._apply_number("silence_duration", v),
+            "seconds", to=60, step=0.5)
+        row(sec, 2, "Stop after silence", stop_box,
+            "0 disables it — then only the key ends a dictation.")
 
-        def apply_silence(*_a):
-            try:
-                app.set_config("silence_duration", max(0.0, float(sil_var.get())))
-            except ValueError:
-                pass
-        sil = tk.Spinbox(win, from_=0, to=60, increment=0.5, width=8,
-                         textvariable=sil_var, command=apply_silence,
-                         bg=C["bar_bg"], fg=C["text"], insertbackground=C["text"],
-                         font=("Consolas", 10))
-        sil.bind("<FocusOut>", apply_silence)
-        sil.bind("<Return>", apply_silence)
-        place(sil, "Seconds. 0 disables it — end every dictation with the key.")
+        thr_box, _, floor_lbl = self._settings_number(
+            sec, f"{app.cfg.silence_threshold:g}",
+            lambda v: self._apply_number("silence_threshold", v),
+            "level", to=32768, step=25)
+        row(sec, 4, "Silence threshold", thr_box,
+            "Anything quieter counts as silence.")
+        self._set["floor_lbl"] = floor_lbl
 
-        # ── Silence threshold ──
-        label("Silence threshold")
-        thr_var = tk.StringVar(value=f"{app.cfg.silence_threshold:g}")
-
-        def apply_threshold(*_a):
-            try:
-                app.set_config("silence_threshold", max(0.0, float(thr_var.get())))
-            except ValueError:
-                pass
-        thr = tk.Spinbox(win, from_=0, to=32768, increment=25, width=8,
-                         textvariable=thr_var, command=apply_threshold,
-                         bg=C["bar_bg"], fg=C["text"], insertbackground=C["text"],
-                         font=("Consolas", 10))
-        thr.bind("<FocusOut>", apply_threshold)
-        thr.bind("<Return>", apply_threshold)
-        place(thr, "Below this counts as silence. The startup log prints your "
-                   "idle noise floor.")
-
-        # ── Idle unload ──
-        label("Release model when idle")
+        # ══ Memory ══
+        sec = section("Memory")
         idle_labels = [text for _m, text in IDLE_CHOICES]
         cur_idle = next((t for m, t in IDLE_CHOICES
                          if abs(app.cfg.idle_unload_seconds - m * 60) < 1),
                         idle_labels[0])
-        idle_box, _ = combo(
-            idle_labels, cur_idle,
+        idle_box, _, _ = self._settings_option(
+            sec, idle_labels, cur_idle,
             lambda v: app.set_idle_unload(
                 next(m for m, t in IDLE_CHOICES if t == v)))
-        place(idle_box)
+        row(sec, 0, "Release model", idle_box,
+            "Reloading from the local cache takes about a second, so holding "
+            "1.6 GB all day is usually the worse trade.")
 
-        # ── API key ──
-        label("OpenAI API key")
-        key_row = tk.Frame(win, bg=C["bg"])
-        key_state = tk.Label(
-            key_row,
-            text=(f"set (from the {app.cfg.api_key_source})"
-                  if app.cfg.api_key_source else "not set"),
-            bg=C["bg"], fg=C["dim"], font=("Segoe UI", 9))
-        key_state.pack(side="left", padx=(0, 10))
-        tk.Button(key_row, text="Set / replace…",
-                  command=self._ask_api_key).pack(side="left")
-        place(key_row, f"Stored in {API_KEY_PATH}")
+        # ══ OpenAI ══
+        sec = section("OpenAI")
+        key_wrap = tk.Frame(sec, bg=C["bg"])
+        key_state = tk.Label(key_wrap, text="", bg=C["bg"], fg=C["dim"],
+                             font=("Segoe UI", 9))
+        key_state.pack(side="left", padx=(0, 12))
+        self._settings_button(key_wrap, "Set / replace…",
+                              self._ask_api_key).pack(side="left")
+        # Home-relative: the absolute path wraps mid-directory and reads as a
+        # broken string rather than a location.
+        try:
+            short_path = "~" + os.sep + str(API_KEY_PATH.relative_to(Path.home()))
+        except ValueError:
+            short_path = str(API_KEY_PATH)
+        row(sec, 0, "API key", key_wrap,
+            f"Kept in {short_path} — never in config.json, never in the repo.")
+        self._set["key_state"] = key_state
 
-        tk.Frame(win, bg=C["sep"], height=1).grid(
-            row=row["n"], column=0, columnspan=2, sticky="we", padx=16, pady=(6, 0))
-        row["n"] += 1
-        tk.Label(win, text="Changes apply immediately. Only the push-to-talk key "
-                           "needs a restart.",
-                 bg=C["bg"], fg=C["dim"], font=("Segoe UI", 8)).grid(
-                     row=row["n"], column=0, columnspan=2, sticky="w",
-                     padx=16, pady=(6, 2))
-        row["n"] += 1
-        tk.Button(win, text="Close", command=on_close).grid(
-            row=row["n"], column=1, sticky="e", padx=16, pady=(4, 14))
+        # ── Footer ──
+        foot = tk.Frame(body, bg=C["bg"])
+        foot.pack(fill="x", padx=22, pady=(18, 18))
+        tk.Frame(foot, bg=C["sep"], height=1).pack(fill="x", pady=(0, 12))
+        self._settings_button(foot, "Close", on_close).pack(side="right")
 
+        self._refresh_settings()
         win.update_idletasks()
         x = self.root.winfo_screenwidth() // 2 - win.winfo_reqwidth() // 2
-        win.geometry(f"+{max(x, 0)}+180")
+        y = max(60, self.root.winfo_screenheight() // 2 - win.winfo_reqheight() // 2)
+        win.geometry(f"+{max(x, 0)}+{y}")
         win.lift()
         win.focus_force()
+
+    def _apply_number(self, key, raw):
+        try:
+            self.app.set_config(key, max(0.0, float(raw)))
+        except (TypeError, ValueError):
+            pass                            # half-typed value; ignore
+
+    def _refresh_settings(self):
+        """Re-sync the live parts. Tk thread only.
+
+        The model list belongs to whichever engine is loaded, so switching
+        engines has to repopulate it — otherwise the window keeps offering the
+        previous engine's models, which is exactly the trap the tray menu had.
+        """
+        win = getattr(self, "_settings_win", None)
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._settings_win = None
+                return
+        except tk.TclError:
+            self._settings_win = None
+            return
+
+        app = self.app
+        switching = app.model_switching
+
+        if "engine_var" in self._set:
+            self._set["engine_var"].set(app.engine_kind)
+        if "engine_hint" in self._set and self._set["engine_hint"]:
+            self._set["engine_hint"].config(
+                text="Switching engine — reloading the model…" if switching
+                else "Local runs on your GPU. The API uploads the audio "
+                     "and charges per minute.",
+                fg=self.C["bar_mid"] if switching else self.C["dim"])
+        if "model_fill" in self._set:
+            if switching:
+                self._set["model_fill"](["Switching…"], "Switching…", enabled=False)
+            else:
+                names = [m.name for m in app.model_catalog()] or [app.model_name]
+                self._set["model_fill"](names, app.model_name, enabled=True)
+        if "key_state" in self._set:
+            source = app.cfg.api_key_source
+            self._set["key_state"].config(
+                text=f"set — from the {source}" if source else "not set",
+                fg=self.C["bar_lo"] if source else self.C["dim"])
+        if "floor_lbl" in self._set:
+            floor = getattr(app, "noise_floor", None)
+            # One decimal below 10: a noise-suppressing mic idles at 0.5, and
+            # rounding that to "0" hides the very thing worth seeing.
+            self._set["floor_lbl"].config(
+                text="" if floor is None else
+                f"yours idles at {floor:.1f}" if floor < 10 else
+                f"yours idles at {floor:.0f}")
 
     def ask_api_key(self):
         """Prompt for the OpenAI key. Runs on the Tk thread; the tray callback
@@ -1235,6 +1374,11 @@ class TkUI:
         """
         if not self.tray_icon:
             return
+        # The settings window shows the same state; it has to move with it, and
+        # touching Tk has to happen on the Tk thread — refresh_tray is called
+        # from the worker.
+        if getattr(self, "_settings_win", None) is not None:
+            self.root.after(0, self._refresh_settings)
         try:
             self.tray_icon.menu = self._build_tray_menu()
             self.tray_icon.icon = make_tray_icon(self._tray_state or "idle")
