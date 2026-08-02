@@ -46,6 +46,14 @@ from ..jobs import JobStatus
 from ..log import LOG_PATH, log
 
 OV_W = 380
+
+#: Fixed panel heights. Sizing to content meant expanding a history row or
+#: showing a two-line error resized the window under the pointer; two stable
+#: sizes are calmer and still proportionate — a recording HUD should not be as
+#: tall as a 50-entry archive.
+OV_H_COMPACT = 212
+OV_H_HISTORY = 470
+
 HTML_PATH = Path(__file__).with_name("overlay.html")
 
 from .common import ENGINES, IDLE_CHOICES, LANGUAGES
@@ -211,7 +219,7 @@ class AppKitUI:
         self.history_mode = False
 
         self._pos = None            # user-dragged position, screen coords
-        self._height = 120
+        self._height = OV_H_COMPACT
         self._ready = False
         self._pending = []          # JS calls queued until the page loads
         self._last_level = 0.0
@@ -320,7 +328,7 @@ class AppKitUI:
             self._apply_a11y()
             self._apply_appearance()
         elif action == "height":
-            self._set_height(int(msg["height"]))
+            pass        # the panel is a fixed size per mode; see _push_state
         elif action == "drag":
             self._drag(float(msg["dx"]), float(msg["dy"]))
         elif action == "hide":
@@ -433,6 +441,7 @@ class AppKitUI:
         if rec_start is not None:
             state["recStart"] = int(rec_start * 1000)
         self._js(f"wt.setState({_json(state)}); wt.setMode({_json(mode)});")
+        self._set_height(OV_H_HISTORY if mode == "history" else OV_H_COMPACT)
 
     # ── Transient states ──
 

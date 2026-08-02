@@ -88,6 +88,7 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
+  height: 100%;
   background: transparent;          /* the material must show through */
   color: var(--label);
   font: 13px/1.4 var(--font);
@@ -98,7 +99,14 @@ html, body {
   overflow: hidden;
 }
 
-#root { width: 380px; position: relative; }
+/* The panel height is fixed by AppKit per mode, not by the content: expanding
+   a history row or a long error message used to resize the window under the
+   pointer. Everything inside flexes to fill it instead. */
+#root {
+  width: 380px; height: 100%; position: relative;
+  display: flex; flex-direction: column;
+}
+#titlebar, #status, #message, #queue { flex: none; }
 
 /* The faint inner rim every real macOS panel has. Out of flow, so the height
    report is unaffected. */
@@ -145,7 +153,7 @@ html, body {
 /* ── Title bar ───────────────────────────────────────────────────────────── */
 #titlebar {
   display: flex; align-items: center; justify-content: space-between;
-  height: 28px; padding: 0 3px 0 var(--gutter);
+  height: 30px; padding: 0 8px 0 var(--gutter);
   border-bottom: 1px solid var(--hairline);
 }
 #title { font: 600 11px/1 var(--font); color: var(--label-2); }
@@ -183,18 +191,23 @@ html, body {
 }
 #timer:empty { display: none; }
 
+/* Centred, not baseline-aligned: the arrow is a masked glyph with no baseline
+   of its own, so on a baseline row it sat visibly high against the text. */
 #meta {
-  display: flex; align-items: baseline; gap: var(--gap-item);
+  display: flex; align-items: center; gap: var(--gap-item);
   margin-top: var(--gap-pair); min-height: 15px;   /* no reflow when empty */
   font-size: 11px; color: var(--label-2);
 }
 #model { flex: none; }
 #target {
   flex: 1 1 auto; min-width: 0;
-  display: flex; align-items: baseline; gap: 4px;
+  display: flex; align-items: center; gap: 4px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-#target .sym { --sym: var(--sym-arrow); width: 11px; height: 11px; color: var(--label-3); }
+#target .sym {
+  --sym: var(--sym-arrow); width: 11px; height: 11px;
+  align-self: center; color: var(--label-3);
+}
 #target:empty { display: none; }
 #gpu-chip { flex: none; margin-left: auto; color: var(--label-3); }
 
@@ -278,7 +291,9 @@ html, body {
 
 /* ── Hint ────────────────────────────────────────────────────────────────── */
 #hint {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+  flex: none; margin-top: auto;      /* pinned to the bottom of a fixed panel */
+  display: flex; flex-wrap: wrap;
+  align-items: center; justify-content: center; gap: 4px 14px;
   padding: 10px var(--gutter) 12px;
   border-top: 1px solid var(--hairline);
   font-size: 11px; color: var(--label-2);
@@ -303,7 +318,14 @@ html, body {
    only thing anyone is scanning for.
    ══════════════════════════════════════════════════════════════════════════ */
 
-#history { padding-bottom: 4px; }
+/* Fills whatever the fixed panel leaves; the list scrolls inside it. */
+#history {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+  padding-bottom: 4px;
+}
+#history.hidden { display: none !important; }
+#h-head { flex: none; }
 
 #h-head { display: flex; align-items: baseline; gap: 6px; padding: 10px 10px 8px var(--gutter); }
 #h-title { font: 600 15px/1.2 var(--font); letter-spacing: -0.01em; color: var(--label); }
@@ -319,7 +341,10 @@ html, body {
   background: color-mix(in srgb, var(--rec) 15%, var(--tint-base));
 }
 
-#h-scroll { max-height: 340px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+#h-scroll {
+  flex: 1 1 auto; min-height: 0;     /* the panel is fixed; this absorbs it */
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+}
 /* No ::-webkit-scrollbar rules — the system overlay scrollbar is correct. */
 
 /* Sticky day header. backdrop-filter blurs PAGE content behind PAGE content,
@@ -722,7 +747,8 @@ html, body {
       const root = $("root");
       root.dataset.mode = state.mode;
       $("state").textContent = LABEL[state.mode] || "Ready";
-      $("title").textContent = state.mode === "history" ? "History" : "WhisperType";
+      // The title bar always names the app. In history mode the section
+      // header already says "History" — saying it twice read as a bug.
       $("model").textContent = state.model || "";
 
       const tgt = $("target");
