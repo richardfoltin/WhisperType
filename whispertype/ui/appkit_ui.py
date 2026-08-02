@@ -137,6 +137,18 @@ class Bridge(NSObject):
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 class AppKitUI:
+    #: The benchmark results table is Tk-only — this overlay is an HTML page
+    #: with no per-model rows, so the tray items are not offered here either.
+    #: App.benchmark_supported() reads this; the two hooks below stay no-ops so
+    #: the shared worker can call them without platform checks.
+    supports_benchmark = False
+
+    def show_benchmark(self, job):
+        pass
+
+    def refresh_benchmark(self):
+        pass
+
     def __init__(self, app):
         self.app = app
         self.visible = False

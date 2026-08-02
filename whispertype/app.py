@@ -5,13 +5,16 @@ hotkey listener, the recording thread and the single transcription worker.
 Everything platform specific goes through `self.backend` (input synthesis,
 window targeting, GPU counter) and `self.ui` (overlay + tray).
 """
+import json
 import threading
 import time
+from pathlib import Path
 
 import pynput.keyboard
 
 from . import __version__, audio, config
-from .jobs import JobQueue, JobStatus, ModelSwitch, ModelUnload, TranscriptionJob
+from .jobs import (BenchmarkJob, BenchmarkResult, JobQueue, JobStatus,
+                   ModelSwitch, ModelUnload, TranscriptionJob)
 from . import transcribe as transcribe_mod
 from .log import log
 from .transcribe import create_engine
@@ -76,6 +79,13 @@ class App:
 
         self.target = None
         self.target_title = ""
+
+        #: Benchmark mode. Armed from the tray; the next recording is run
+        #: through every downloaded model instead of being typed anywhere.
+        self.benchmark_next = False
+        self.benchmark_job = None       # running BenchmarkJob, for the live panel
+        self.last_benchmark = None      # last finished one, for "Open last"
+        self.downloading_all = False
 
         # Our own synthetic keystrokes are visible to the global listener. A
         # transcript containing a space would otherwise toggle history mode,
@@ -252,6 +262,9 @@ class App:
                 if isinstance(item, ModelUnload):
                     self._handle_unload()
                     continue
+                if isinstance(item, BenchmarkJob):
+                    self._run_benchmark(item)
+                    continue
                 self._handle_job(item)
             except Exception as e:
                 log(f"Worker error: {e}")
@@ -328,6 +341,154 @@ class App:
             self.ui.call_later(100, self.ui.check_hide)
             if not self.jobs.busy() and not self.recording:
                 self.ui.set_tray_state("error" if self.last_error else "idle")
+
+    # ── Benchmark ────────────────────────────────────────────────────────
+
+    def benchmark_supported(self):
+        return getattr(self.ui, "supports_benchmark", False)
+
+    def toggle_benchmark_next(self):
+        if not self.benchmark_supported():
+            return
+        self.benchmark_next = not self.benchmark_next
+        log(f"Benchmark mode {'ARMED' if self.benchmark_next else 'disarmed'}")
+        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.call_soon(self.ui.refresh)
+
+    def open_last_benchmark(self):
+        job = self.last_benchmark
+        if job is not None:
+            self.ui.call_soon(lambda: self.ui.show_benchmark(job))
+
+    def download_all_models(self):
+        if self.downloading_all:
+            return
+        threading.Thread(target=self._download_all, daemon=True).start()
+
+    def _download_all(self):
+        missing = [m.name for m in self.engine.catalog() if not m.downloaded]
+        if not missing:
+            log("All models already downloaded.")
+            return
+        self.downloading_all = True
+        self.ui.set_tray_state("downloading")
+        try:
+            log(f"Pre-downloading {len(missing)} model(s): {', '.join(missing)}")
+            for name in missing:
+                try:
+                    log(f"Downloading {name}...")
+                    self.engine.predownload(name)
+                    log(f"Downloaded {name}.")
+                except Exception as e:
+                    log(f"Failed to download {name}: {e}")
+                self.ui.call_soon(self.ui.refresh_tray)
+            log("Model pre-download finished.")
+        finally:
+            self.downloading_all = False
+            # predownload may have displaced the resident model (MLX keeps
+            # exactly one), so make sure dictation still has one.
+            if not self.engine.loaded and self.model_name:
+                try:
+                    self.engine.load(self.model_name)
+                except Exception as e:
+                    self.set_error(f"Could not reload {self.model_name}: {e}")
+            self.ui.set_tray_state("error" if self.last_error else "idle")
+            self.ui.call_soon(self.ui.refresh_tray)
+
+    def _run_benchmark(self, job):
+        log(f"Benchmark job {job.job_id} started "
+            f"({job.audio_duration:.1f}s audio, {len(job.results)} models)")
+        original = self.model_name
+        # Blocks the push-to-talk key and the tray's model menu for the run.
+        self.model_switching = True
+        self.benchmark_job = job
+
+        def refresh():
+            self.ui.call_soon(self.ui.refresh_benchmark)
+
+        # Drop the dictation model first: otherwise every benchmarked model
+        # shares VRAM with it, and large-v3 next to large-v3-turbo is ~4.7 GB.
+        try:
+            self.engine.unload()
+        except Exception as e:
+            log(f"Could not unload before benchmark: {e}")
+
+        self.ui.call_soon(lambda: self.ui.show_benchmark(job))
+        refresh()
+
+        for result in job.results:
+            model = None
+            try:
+                result.status = "loading"
+                refresh()
+                model, result.load_secs = self.engine.load_for_benchmark(result.model)
+
+                result.status = "running"
+                refresh()
+                t0 = time.perf_counter()
+                result.text = self.engine.transcribe_with(
+                    model, job.audio_bytes, self.cfg.language)
+                result.transcribe_secs = time.perf_counter() - t0
+                result.status = "done"
+                log(f"Benchmark [{result.model}] "
+                    f"{result.transcribe_secs:.2f}s: {result.text[:60]}")
+            except Exception as e:
+                result.status = "error"
+                result.error = str(e)
+                log(f"Benchmark [{result.model}] ERROR: {e}")
+            finally:
+                # Also runs when the load or the decode raised, so a partially
+                # loaded model cannot stay pinned for the rest of the run.
+                model = None
+                self.engine.free_cache()
+            refresh()
+
+        self._save_benchmark(job)
+        self.last_benchmark = job
+        self.benchmark_job = None
+
+        try:
+            log(f"Restoring {original}...")
+            self.engine.load(original)
+            self.model_ready = True
+        except Exception as e:
+            self.model_ready = False
+            self.set_error(f"Could not restore {original} after the benchmark: {e}")
+
+        self.model_switching = False
+        self.ui.call_soon(self.ui.refresh_tray)
+        refresh()
+        log(f"Benchmark job {job.job_id} complete")
+
+    def _save_benchmark(self, job):
+        directory = Path.home() / ".whispertype" / "benchmarks"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(job.created_at))
+            data = {
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                            time.localtime(job.created_at)),
+                "audio_duration_secs": round(job.audio_duration, 2),
+                "app": job.app_name,
+                "window": job.window_name,
+                "device": self.engine.device_label,
+                "language": self.cfg.language,
+                "results": [vars(r) for r in job.results],
+            }
+            path = directory / f"benchmark_{stamp}.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            with open(directory / "benchmark_log.txt", "a", encoding="utf-8") as f:
+                f.write(f"\n=== {data['created_at']}  "
+                        f"audio={data['audio_duration_secs']}s  "
+                        f"device={data['device']} ===\n")
+                for r in job.results:
+                    secs = f"{r.transcribe_secs:.2f}s" if r.transcribe_secs else "—"
+                    f.write(f"  [{r.model:<16}] {secs:>7}  "
+                            f"{r.text if r.text is not None else (r.error or '')}\n")
+            log(f"Benchmark saved: {path.name}")
+        except Exception as e:
+            log(f"Could not save the benchmark: {e}")
 
     def _deliver(self, text, job):
         if job.target is None:
@@ -432,6 +593,30 @@ class App:
                 app_name = self.backend.target_app(target) if target is not None else "?"
             except Exception:
                 app_name = "?"
+
+            if self.benchmark_next:
+                self.benchmark_next = False
+                self.enter_stop = False
+                self.ui.call_soon(self.ui.refresh_tray)
+                downloaded = [m.name for m in self.engine.catalog() if m.downloaded]
+                if not downloaded:
+                    log("Benchmark skipped: no models are downloaded")
+                    self.ui.call_soon(self.ui.on_recording_stopped)
+                    return
+                bench = BenchmarkJob(
+                    job_id=self.jobs.next_id(),
+                    audio_bytes=data,
+                    audio_duration=duration,
+                    window_name=window_name,
+                    app_name=app_name,
+                    results=[BenchmarkResult(model=m) for m in downloaded],
+                )
+                self.ui.call_soon(self.ui.on_recording_stopped)
+                self.jobs.submit_control(bench)
+                log(f"Enqueued BENCHMARK job {bench.job_id} "
+                    f"({duration:.1f}s, {len(downloaded)} models)")
+                self.ui.set_tray_state("transcribing")
+                return
 
             send_enter = self.enter_stop
             self.enter_stop = False

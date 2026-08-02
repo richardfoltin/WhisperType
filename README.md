@@ -172,15 +172,19 @@ Nothing is ever lost to a failed hand-off: if the target window has closed, or t
 
 ---
 
-## Benchmark
+## Benchmark (Windows)
 
-Right-click the tray icon > **Benchmark next recording**, then dictate as usual. Instead of typing the result, WhisperType runs that one recording through **every downloaded model** and shows a comparison table: load time, transcribe time, and the text each model produced.
+Right-click the tray icon > **Benchmark next recording**, then dictate as usual. Instead of typing the result, WhisperType runs that one clip through **every downloaded model** and shows a comparison table: load time, transcribe time, and the text each model produced.
 
-Results are also written to `%USERPROFILE%\.whispertype\benchmarks\` as JSON plus an append-only `benchmark_log.txt`.
+The models are loaded one at a time — the dictation model is released first and each benchmarked model is freed before the next is loaded, so a full run does not need seven models' worth of VRAM. Your original model is restored at the end.
+
+Results are also written to `~/.whispertype/benchmarks/` as JSON plus an append-only `benchmark_log.txt`.
 
 Use **Download all models** in the tray menu first if you want the comparison to cover everything rather than just what happens to be cached.
 
-This is the quickest way to answer "is `large-v3` actually worth the extra seconds for my voice and my vocabulary" — and, if you are on a pre-Turing GPU, to compare `"fp16": true` against `"fp16": false` (see Configuration).
+This is the quickest way to answer "is `large-v3` actually worth the extra seconds for my voice and my vocabulary" — and, if you are on a pre-Turing GPU, to compare `"fp16": true` against `"fp16": false` (see Configuration). The benchmark decodes with exactly the same options as normal dictation, so what it measures is what you get.
+
+The results panel is Windows-only: the macOS overlay is an HTML page with no table for per-model rows, so the menu items are not offered there.
 
 ---
 

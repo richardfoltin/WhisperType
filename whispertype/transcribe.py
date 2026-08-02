@@ -11,6 +11,7 @@ that evaluates it. Every method here must therefore be called from the single
 transcription worker thread, including the initial load and any model switch.
 """
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -153,9 +154,40 @@ class WhisperEngine:
 
     def load(self, name):
         log(f"Loading {name} on {self.device}...")
+        t0 = time.perf_counter()
         self._model = self._whisper.load_model(name, device=self.device)
         self._name = name
-        log(f"{name} ready on {self.device}.")
+        log(f"{name} ready on {self.device} ({time.perf_counter() - t0:.1f}s).")
+
+    def predownload(self, name):
+        """Fetch a model into the cache without touching the GPU."""
+        m = self._whisper.load_model(name, device="cpu")
+        del m
+        self.free_cache()
+
+    def load_for_benchmark(self, name):
+        """Load a model in isolation and report how long it took.
+
+        Deliberately not stored in self._model: the benchmark must not leave a
+        different model installed as the dictation model if it is interrupted.
+        """
+        t0 = time.perf_counter()
+        model = self._whisper.load_model(name, device=self.device)
+        return model, time.perf_counter() - t0
+
+    def transcribe_with(self, model, audio_bytes, language):
+        """Transcribe on an explicitly supplied model (benchmark path).
+
+        Uses the same decode options as transcribe(), so what the benchmark
+        measures is the decode the user actually dictates with.
+        """
+        audio_np = pcm_to_float32(audio_bytes)
+        result = self._whisper.transcribe(model, audio_np,
+                                          language=language,
+                                          initial_prompt=initial_prompt(),
+                                          fp16=self.fp16,
+                                          **DECODE_OPTIONS)
+        return result["text"].strip()
 
     @property
     def loaded(self):
@@ -268,6 +300,23 @@ class MlxEngine:
         self._repo = repo
         self._name = name
         log(f"{name} ready on Metal.")
+
+    def predownload(self, name):
+        """Fetch a model's weights into the HF cache.
+
+        ModelHolder keeps exactly one model resident, so this necessarily
+        displaces whatever is loaded; the caller reloads afterwards.
+        """
+        repo, _ = self.REPOS[name]
+        self._holder.get_model(repo, self._mx.float16)
+        self._holder.model = None
+        self._holder.model_path = None
+        try:
+            import gc
+            gc.collect()
+            self._mx.clear_cache()
+        except Exception:
+            pass
 
     @property
     def loaded(self):

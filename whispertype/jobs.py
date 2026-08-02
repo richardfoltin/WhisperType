@@ -56,6 +56,35 @@ class TranscriptionJob:
     send_enter: bool = False
 
 
+@dataclass
+class BenchmarkResult:
+    """One model's run over the benchmark clip."""
+    model: str
+    #: waiting -> loading -> running -> done | error
+    status: str = "waiting"
+    load_secs: float = None
+    transcribe_secs: float = None
+    text: str = None
+    error: str = None
+
+
+@dataclass
+class BenchmarkJob:
+    """Run one recording through every downloaded model and compare.
+
+    Carries no delivery target: a benchmark is never typed anywhere, so there
+    is no reason to hold a live window handle alive for the several minutes a
+    full run takes. window_name/app_name are kept for the record only.
+    """
+    job_id: int
+    audio_bytes: bytes
+    audio_duration: float
+    window_name: str = ""
+    app_name: str = ""
+    created_at: float = field(default_factory=time.time)
+    results: list = field(default_factory=list)
+
+
 class JobQueue:
     """Owns the pending queue, the visible job list and the history list.
 
@@ -103,11 +132,18 @@ class JobQueue:
                 self._active.remove(job)
 
     def cancel(self, job):
-        """Mark cancelled *and* drop from the visible list. The worker checks
-        the status when it dequeues, so a queued job is really skipped."""
+        """Mark cancelled. The worker checks the status when it dequeues, so a
+        queued job is really skipped rather than merely hidden.
+
+        A job that is already TRANSCRIBING stays in the active list until the
+        worker retires it: busy() is what quit() consults to decide whether to
+        wait, and dropping a running job early would let the UI be torn down
+        while the model is still working.
+        """
         with self._lock:
+            was_waiting = job.status == JobStatus.WAITING
             job.status = JobStatus.CANCELLED
-            if job in self._active:
+            if was_waiting and job in self._active:
                 self._active.remove(job)
 
     def set_status(self, job, status):

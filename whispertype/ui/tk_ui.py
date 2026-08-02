@@ -164,6 +164,41 @@ class TkUI:
 
         self.history_item_widgets = []
 
+        # ── Benchmark panel (Windows/Tk only) ──
+        self.benchmark_frame = tk.Frame(self.root, bg=self.C["bg"])
+        tk.Frame(self.benchmark_frame, bg=self.C["sep"], height=1).pack(
+            fill="x", padx=14, pady=(2, 4))
+        bench_hdr = tk.Frame(self.benchmark_frame, bg=self.C["bg"])
+        bench_hdr.pack(fill="x", padx=14)
+        bench_hdr.columnconfigure(2, weight=1)
+        _bf = ("Consolas", 8)
+        tk.Label(bench_hdr, text="BENCHMARK", bg=self.C["bg"], fg=self.C["dim"],
+                 font=("Segoe UI", 8, "bold"), anchor="w").grid(
+                     row=0, column=0, sticky="w")
+        self.bench_title_lbl = tk.Label(bench_hdr, text="", bg=self.C["bg"],
+                                        fg=self.C["dim"], font=_bf, anchor="w")
+        self.bench_title_lbl.grid(row=0, column=2, sticky="we", padx=(8, 0))
+        bench_close = tk.Label(bench_hdr, text="×", bg=self.C["bg"], fg="#ef4444",
+                               font=("Segoe UI", 11, "bold"), cursor="hand2")
+        bench_close.grid(row=0, column=3, sticky="e", padx=(4, 0))
+        bench_close.bind("<Button-1>", lambda e: self._close_benchmark())
+
+        bench_cols = tk.Frame(self.benchmark_frame, bg=self.C["bg"])
+        bench_cols.pack(fill="x", padx=14, pady=(2, 0))
+        bench_cols.columnconfigure(2, weight=1)
+        for txt, w, col in (("MODEL", 16, 0), ("TIME", 8, 1)):
+            tk.Label(bench_cols, text=txt, bg=self.C["bg"], fg=self.C["dim"],
+                     font=_bf, width=w, anchor="w").grid(row=0, column=col, sticky="w")
+        tk.Label(bench_cols, text="TEXT", bg=self.C["bg"], fg=self.C["dim"],
+                 font=_bf, anchor="w").grid(row=0, column=2, sticky="we", padx=(4, 0))
+
+        # Not scrollable: at most one row per downloaded model.
+        self.benchmark_items_frame = tk.Frame(self.benchmark_frame, bg=self.C["bg"])
+        self.benchmark_items_frame.pack(fill="x", padx=14, pady=(0, 6))
+        self.benchmark_item_widgets = []
+        self._benchmark_view_job = None
+        self.benchmark_mode = False
+
         self._tooltip = None
 
         self.root.geometry(f"{OV_W}x120")
@@ -188,6 +223,7 @@ class TkUI:
 
         self.tray_icon = None
         self._tray_thread = None
+        self._tray_state = "idle"
 
     # ── UI interface: thread marshalling ──
 
@@ -240,10 +276,13 @@ class TkUI:
         self.rec_frame.pack_forget()
         self.queue_frame.pack_forget()
         self.history_frame.pack_forget()
+        self.benchmark_frame.pack_forget()
         if self.app.backend.gpu_available:
             self.gpu_frame.pack(fill="x")
         self.rec_frame.pack(fill="x")
-        if self.history_mode:
+        if self.benchmark_mode:
+            self.benchmark_frame.pack(fill="x")
+        elif self.history_mode:
             self.history_frame.pack(fill="x")
         elif self.app.jobs.active_count() > 0:
             self.queue_frame.pack(fill="x")
@@ -253,11 +292,23 @@ class TkUI:
         k = self.app.ptt_label
         secs = self.app.cfg.silence_duration
         if self.app.recording:
-            self.dot.config(fg=self.C["rec"])
-            self.state_lbl.config(text="Recording", fg=self.C["text"])
+            armed = self.app.benchmark_next
+            self.dot.config(fg=self.C["bar_mid"] if armed else self.C["rec"])
+            self.state_lbl.config(
+                text="Recording (benchmark)" if armed else "Recording",
+                fg=self.C["bar_mid"] if armed else self.C["text"])
+            stop = f"{secs:.0f}s silence" if secs > 0 else "no auto-stop"
             self.hint.config(
-                text=f"Transcribe: {k} / Enter↵ / {secs:.0f}s silence"
-                     f"  |  History: Space  |  Hide: Esc")
+                text=f"Transcribe: {k} / Enter↵ / {stop}"
+                     f"  |  History: Space  |  Esc: discard")
+        elif self.benchmark_mode:
+            running = self.app.benchmark_job is not None
+            self.dot.config(fg=self.C["bar_mid"] if running else self.C["bar_lo"])
+            self.state_lbl.config(
+                text="Benchmarking…" if running else "Benchmark results",
+                fg=self.C["bar_mid"] if running else self.C["bar_lo"])
+            self.timer.config(text="")
+            self.hint.config(text="Close: ×  |  Hide: Esc")
         elif self.history_mode:
             self.dot.config(fg=self.C["bar_lo"])
             self.state_lbl.config(text="History", fg=self.C["bar_lo"])
@@ -289,7 +340,14 @@ class TkUI:
         if self.app.backend.gpu_available:
             h += 62
         h += 130
-        if self.history_mode:
+        if self.benchmark_mode:
+            # sep + BENCHMARK row + column headers, then one row per model. A
+            # run only covers downloaded models, so sizing off the full
+            # catalogue would leave dead space.
+            job = self._benchmark_view_job
+            rows = len(job.results) if job and job.results else 1
+            h += 48 + rows * HISTORY_ITEM_H
+        elif self.history_mode:
             n = self.app.jobs.history_count()
             visible = min(n, VISIBLE_HISTORY) if n > 0 else 1
             h += 34 + visible * HISTORY_ITEM_H
@@ -319,6 +377,7 @@ class TkUI:
         # and level rate and could never be cancelled again.
         self._cancel_timer_blink()
         self.history_mode = False
+        self.benchmark_mode = False
         self._t0 = time.time()
         self.model_lbl.config(text=f"Model: {self.app.model_name}")
         self.target_lbl.config(text=f"→ {target_name}" if target_name else "")
@@ -336,6 +395,11 @@ class TkUI:
 
     def on_recording_stopped(self):
         self._cancel_timer_blink()
+        # A panel the user deliberately opened must not be pulled away by a
+        # job landing behind it.
+        if self.history_mode or self.benchmark_mode:
+            self._show_overlay()
+            return
         if self.app.jobs.busy():
             self._show_rec_idle()
             self._show_overlay()
@@ -344,10 +408,12 @@ class TkUI:
 
     def refresh(self):
         if (self.app.recording or self.app.jobs.busy() or self.history_mode
-                or self.app.last_error or self._message):
+                or self.benchmark_mode or self.app.last_error or self._message):
             if not self.app.recording:
                 self._show_rec_idle()
-            if self.history_mode:
+            if self.benchmark_mode:
+                self._rebuild_benchmark()
+            elif self.history_mode:
                 self._rebuild_history()
             self._show_overlay()
         else:
@@ -357,8 +423,8 @@ class TkUI:
         # An unacknowledged error keeps the overlay up — it is the only place
         # the reason is written down.
         if (not self.app.jobs.busy() and not self.app.recording
-                and not self.history_mode and not self.app.last_error
-                and not self._message):
+                and not self.history_mode and not self.benchmark_mode
+                and not self.app.last_error and not self._message):
             self.hide()
 
     # ── Transient states (mirrors the macOS UI's contract) ──
@@ -387,6 +453,10 @@ class TkUI:
     def set_history_mode(self, on):
         self.history_mode = on
         if on:
+            # _repack draws the benchmark panel ahead of history, so switching
+            # to history would otherwise silently do nothing while it is up.
+            self.benchmark_mode = False
+            self._benchmark_view_job = None
             self._cancel_timer_blink()
             self._rebuild_history()
         self._repack()
@@ -405,7 +475,9 @@ class TkUI:
         self.rec_frame.pack_forget()
         self.queue_frame.pack_forget()
         self.history_frame.pack_forget()
+        self.benchmark_frame.pack_forget()
         self.history_mode = False
+        self.benchmark_mode = False
         self.root.attributes("-alpha", 0.0)
         self.root.geometry(OFF_SCREEN)
         self.visible = False
@@ -521,6 +593,110 @@ class TkUI:
         else:
             self._history_scrollbar.pack_forget()
             self._history_canvas.configure(height=len(items) * HISTORY_ITEM_H)
+
+    # ── Benchmark panel ──
+
+    #: The AppKit overlay is an HTML page with no per-model table, so the
+    #: benchmark UI is Tk-only. App.benchmark_supported() reads this.
+    supports_benchmark = True
+
+    def show_benchmark(self, job):
+        self._benchmark_view_job = job
+        self.benchmark_mode = True
+        self.history_mode = False
+        # The panel takes the overlay; a live recording would fight it for the
+        # same window, and its audio is not what the benchmark is measuring.
+        if self.app.recording:
+            self.app.stop_recording(discard=True)
+            self._cancel_timer_blink()
+            log("Recording discarded — the benchmark panel took the overlay")
+        self._rebuild_benchmark()
+        self._show_overlay()
+
+    def refresh_benchmark(self):
+        job = (self.app.benchmark_job or self.app.last_benchmark
+               or self._benchmark_view_job)
+        if job is None:
+            return
+        self._benchmark_view_job = job
+        if not self.benchmark_mode:
+            return
+        self._rebuild_benchmark()
+        self._show_overlay()
+
+    def _close_benchmark(self):
+        # Only the panel closes — a run still in flight keeps going.
+        self.benchmark_mode = False
+        self._benchmark_view_job = None
+        self.hide()
+
+    def _rebuild_benchmark(self):
+        for w in self.benchmark_item_widgets:
+            w.destroy()
+        self.benchmark_item_widgets = []
+
+        job = self._benchmark_view_job
+        if job is None:
+            return
+
+        created = time.strftime("%H:%M:%S", time.localtime(job.created_at))
+        self.bench_title_lbl.config(
+            text=f"{created}  •  {job.audio_duration:.1f}s  •  {job.app_name or '?'}")
+
+        _f = ("Consolas", 8)
+        _bg = self.C["bg"]
+        icons = {"waiting": ("○", self.C["dim"]),
+                 "loading": ("↻", self.C["bar_mid"]),
+                 "running": ("▶", self.C["trans"]),
+                 "done":    ("✓", self.C["bar_lo"]),
+                 "error":   ("×", "#ef4444")}
+
+        for r in job.results:
+            row = tk.Frame(self.benchmark_items_frame, bg=_bg)
+            row.pack(fill="x")
+            row.columnconfigure(2, weight=1)
+            self.benchmark_item_widgets.append(row)
+
+            icon, icon_col = icons.get(r.status, ("?", self.C["dim"]))
+            tk.Label(row, text=f"{icon} {r.model}", bg=_bg, fg=icon_col,
+                     font=_f, width=18, anchor="w").grid(row=0, column=0, sticky="w")
+
+            if r.transcribe_secs is not None:
+                time_txt, time_fg = f"{r.transcribe_secs:.2f}s", self.C["bar_lo"]
+            elif r.status in ("running", "loading"):
+                time_txt, time_fg = "…", self.C["bar_mid"]
+            elif r.status == "error":
+                time_txt, time_fg = "ERR", "#ef4444"
+            else:
+                time_txt, time_fg = "—", self.C["dim"]
+            tk.Label(row, text=time_txt, bg=_bg, fg=time_fg, font=_f,
+                     width=8, anchor="w").grid(row=0, column=1, sticky="w")
+
+            if r.status == "done" and r.text is not None:
+                preview, preview_fg = (r.text[:40] + ("…" if len(r.text) > 40 else ""),
+                                       self.C["text"])
+            elif r.status == "error":
+                preview, preview_fg = (r.error or "error")[:40], "#ef4444"
+            elif r.status == "loading":
+                preview, preview_fg = "loading model…", self.C["bar_mid"]
+            elif r.status == "running":
+                preview, preview_fg = "transcribing…", self.C["bar_mid"]
+            else:
+                preview, preview_fg = "", self.C["dim"]
+
+            lbl = tk.Label(row, text=preview, bg=_bg, fg=preview_fg,
+                           font=_f, anchor="w")
+            lbl.grid(row=0, column=2, sticky="we", padx=(4, 0))
+
+            if r.status == "done" and r.text:
+                tip = r.text[:500] + ("…" if len(r.text) > 500 else "")
+                lbl.bind("<Enter>", lambda e, p=tip: self._show_tooltip(e, p))
+                lbl.bind("<Leave>", lambda e: self._hide_tooltip())
+                copy_btn = tk.Label(row, text="\U0001f4cb", bg=_bg,
+                                    fg=self.C["bar_lo"], font=("Segoe UI", 10),
+                                    cursor="hand2")
+                copy_btn.grid(row=0, column=3, sticky="e", padx=(4, 0))
+                copy_btn.bind("<Button-1>", lambda e, t=r.text: self._copy_text(t))
 
     def _copy_text(self, text):
         self.root.clipboard_clear()
@@ -672,18 +848,39 @@ class TkUI:
             pystray.MenuItem("WhisperType", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Model", pystray.Menu(*items)),
+            pystray.MenuItem(
+                "Download all models",
+                lambda icon, item: self.app.download_all_models(),
+                enabled=lambda item: (not self.app.downloading_all
+                                      and any(not i.downloaded
+                                              for i in self.app.model_catalog())),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Benchmark next recording",
+                lambda icon, item: self.app.toggle_benchmark_next(),
+                checked=lambda item: self.app.benchmark_next,
+            ),
+            pystray.MenuItem(
+                "Open last benchmark",
+                lambda icon, item: self.app.open_last_benchmark(),
+                enabled=lambda item: self.app.last_benchmark is not None,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda icon, item: self.app.quit()),
         )
 
     def set_tray_state(self, state):
+        self._tray_state = state
         if self.tray_icon:
             self.tray_icon.icon = make_tray_icon(state)
 
     def refresh_tray(self):
         if self.tray_icon:
             self.tray_icon.menu = self._build_tray_menu()
-            self.tray_icon.icon = make_tray_icon("idle")
+            # Not a hardcoded "idle": rebuilding the menu during a download or
+            # a benchmark must not reset the icon that says so.
+            self.tray_icon.icon = make_tray_icon(self._tray_state or "idle")
 
     def stop_tray(self):
         if self.tray_icon:
