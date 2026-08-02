@@ -125,6 +125,12 @@ def backend():
     return _backend
 
 
+def reset_device_cache():
+    """Called when the configured device changes, so the next recording opens
+    the new one rather than the cached lookup."""
+    _device_cache.clear()
+
+
 def resolve_device(spec):
     """Cached device lookup — record_until_stop runs this on every recording."""
     key = repr(spec)
@@ -134,6 +140,29 @@ def resolve_device(spec):
         if idx is not None:
             log(f"Capture device resolved: {spec!r} -> index {idx}")
     return _device_cache[key]
+
+
+def list_input_devices():
+    """[(index, name)] for every usable capture device, for the settings UI.
+
+    Windows routinely exposes the same physical microphone several times over
+    different host APIs, so the index matters as much as the name.
+    """
+    out = []
+    try:
+        b = backend()
+        if IS_MAC:
+            for idx, dev in enumerate(b._sd.query_devices()):
+                if dev["max_input_channels"] > 0:
+                    out.append((idx, dev["name"]))
+        else:
+            for idx in range(b._pa.get_device_count()):
+                info = b._pa.get_device_info_by_index(idx)
+                if info.get("maxInputChannels", 0) > 0:
+                    out.append((idx, str(info.get("name", f"device {idx}"))))
+    except Exception as e:
+        log(f"Could not list input devices: {e}")
+    return out
 
 
 class Capture:

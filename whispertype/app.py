@@ -816,6 +816,24 @@ class App:
         log(f"Cancelled job {job.job_id}")
         self.ui.refresh()
 
+    def set_config(self, key, value):
+        """Change one setting and persist it.
+
+        Everything reachable this way is read per job (or per recording), so
+        nothing here needs a restart — the exception is push_to_talk_key, which
+        the listener binds once at startup.
+        """
+        if self.cfg.get(key) == value:
+            return
+        self.cfg.set(key, value)
+        self.cfg.save()
+        log(f"Config: {key} = {value!r}")
+        if key == "input_device":
+            # The resolver caches its lookup, so a device change has to
+            # invalidate it or the next recording opens the old one.
+            audio.reset_device_cache()
+        self.ui.refresh_tray()
+
     def set_language(self, code):
         """Language is read fresh for every job, so this needs no restart."""
         if code == self.cfg.language:

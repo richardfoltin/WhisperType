@@ -72,6 +72,7 @@ To remove everything it created:
 | Open history | **Space** (while recording), or the tray / menu bar |
 | Leave history | **Space** |
 | Hide overlay (discards a recording in progress) | **Esc** |
+| Change any setting | Tray / menu bar ▸ **Settings…** |
 | Switch model | Tray / menu bar ▸ Model |
 | Exit | Tray / menu bar ▸ Exit |
 
@@ -298,7 +299,9 @@ For daily use, **`large-v3-turbo`** is the best balance of speed and accuracy.
 
 ## Configuration
 
-Edit `%USERPROFILE%\.whispertype\config.json` (Windows) or `~/.whispertype/config.json` (macOS):
+On Windows the easy route is **Settings…** in the tray menu. It exists because a Win32 tray menu cannot stay open across a click — `TrackPopupMenuEx` is modal, so the OS dismisses the menu and only *then* delivers the click, and a `radio=True` item is no different (it only swaps the tick for a bullet). Changing three settings through the submenus therefore meant opening the menu three times. The settings window stays open and applies each change as you make it.
+
+The submenus remain for a quick one-off change. Everything below can also be edited by hand in `%USERPROFILE%\.whispertype\config.json` (Windows) or `~/.whispertype/config.json` (macOS):
 
 | Key | Default | Description |
 |-----|---------|-------------|
