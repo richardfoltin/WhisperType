@@ -221,7 +221,9 @@ class WhisperEngine:
             return
         self._model = None
         self.free_cache()
-        log("Model released (idle)")
+        # Not always "idle" — an engine switch unloads too, and labelling that
+        # as an idle release made the log read like the watchdog had fired.
+        log("Model released")
 
     def transcribe(self, audio_bytes, language):
         # Bind the model once: an idle unload or a model switch could rebind

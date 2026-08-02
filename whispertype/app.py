@@ -91,6 +91,8 @@ class App:
         self.benchmark_job = None       # running BenchmarkJob, for the live panel
         self.last_benchmark = None      # last finished one, for "Open last"
         self.downloading_all = False
+        #: Engine the user just picked, while its model is still loading.
+        self._pending_engine = None
 
         # Our own synthetic keystrokes are visible to the global listener. A
         # transcript containing a space would otherwise toggle history mode,
@@ -255,17 +257,30 @@ class App:
 
     @property
     def engine_kind(self):
-        return self.cfg.stt_engine
+        """What the menu should show as selected.
+
+        Prefers the pending choice: swapping the engine reloads a model, which
+        takes seconds, and until then cfg still holds the old value — so the
+        menu would keep the old engine ticked and, worse, keep listing the old
+        engine's models as if the click had not registered.
+        """
+        return self._pending_engine or self.cfg.stt_engine
 
     def request_engine(self, kind):
         """Switch between the local model and the hosted API."""
-        if kind == self.cfg.stt_engine or self.recording or self.model_switching:
+        if kind == self.engine_kind or self.recording or self.model_switching:
             return
         if kind == "openai" and not self.cfg.openai_api_key:
             self.set_error("No OpenAI API key — set one from the menu first")
             return
         self.model_switching = True
+        self._pending_engine = kind
         self.ui.set_tray_state("loading")
+        # Redraw now, not when the switch finishes: the menu has to stop
+        # showing the previous engine's models the moment the click lands.
+        self.ui.refresh_tray()
+        self.ui.show_notice("Switching to "
+                            + ("OpenAI API…" if kind == "openai" else "local model…"))
         self.jobs.submit_control(EngineSwitch(kind))
 
     def _handle_engine_switch(self, msg):
@@ -284,6 +299,10 @@ class App:
             self.model_ready = True
             self.cfg.save()
             self.clear_error()
+            # A freshly loaded model is not idle. Without this the watchdog
+            # sees activity from before the switch and releases it seconds
+            # after it finished loading.
+            self._touch()
             self.ui.set_tray_state("idle")
             log(f"Engine switched to {msg.engine} ({self.model_name})")
         except Exception as e:
@@ -301,7 +320,11 @@ class App:
                 log(f"Could not restore the {previous} engine either: {e2}")
         finally:
             self.model_switching = False
-            self.ui.call_soon(self.ui.refresh_tray)
+            self._pending_engine = None
+            # Direct, not call_soon: the menu contents changed, and routing the
+            # rebuild through the Tk loop makes it depend on a main loop that
+            # may be busy. refresh_tray touches no Tk.
+            self.ui.refresh_tray()
 
     def set_api_key(self, key):
         """Store the key and, if the API engine is selected, re-validate it."""
@@ -313,7 +336,7 @@ class App:
         self.clear_error()
         if hasattr(self.engine, "refresh_models"):
             self.engine.refresh_models()
-        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.refresh_tray()
         return True
 
     def model_catalog(self):
@@ -346,11 +369,11 @@ class App:
             # first point at which the prompt budget can be measured.
             transcribe_mod.report_prompt_budget(self.cfg.language)
             self.ui.set_tray_state("idle")
-            self.ui.call_soon(self.ui.refresh_tray)
+            self.ui.refresh_tray()
             log("Ready.")
         except Exception as e:
             self.set_error(f"Could not load {self.model_name}: {e}")
-            self.ui.call_soon(self.ui.refresh_tray)
+            self.ui.refresh_tray()
 
         while True:
             item = self.jobs.take()
@@ -376,7 +399,7 @@ class App:
     def _handle_unload(self):
         try:
             self.engine.unload()
-            self.ui.call_soon(self.ui.refresh_tray)
+            self.ui.refresh_tray()
         except Exception as e:
             log(f"Unload failed: {e}")
 
@@ -397,7 +420,7 @@ class App:
             self.set_error(f"Could not load {msg.name}: {e}")
         finally:
             self.model_switching = False
-            self.ui.call_soon(self.ui.refresh_tray)
+            self.ui.refresh_tray()
 
     def _handle_job(self, job):
         if job.status == JobStatus.CANCELLED:
@@ -453,7 +476,7 @@ class App:
             return
         self.benchmark_next = not self.benchmark_next
         log(f"Benchmark mode {'ARMED' if self.benchmark_next else 'disarmed'}")
-        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.refresh_tray()
         self.ui.call_soon(self.ui.refresh)
 
     def open_last_benchmark(self):
@@ -482,7 +505,7 @@ class App:
                     log(f"Downloaded {name}.")
                 except Exception as e:
                     log(f"Failed to download {name}: {e}")
-                self.ui.call_soon(self.ui.refresh_tray)
+                self.ui.refresh_tray()
             log("Model pre-download finished.")
         finally:
             self.downloading_all = False
@@ -494,7 +517,7 @@ class App:
                 except Exception as e:
                     self.set_error(f"Could not reload {self.model_name}: {e}")
             self.ui.set_tray_state("error" if self.last_error else "idle")
-            self.ui.call_soon(self.ui.refresh_tray)
+            self.ui.refresh_tray()
 
     def _run_benchmark(self, job):
         log(f"Benchmark job {job.job_id} started "
@@ -557,7 +580,7 @@ class App:
             self.set_error(f"Could not restore {original} after the benchmark: {e}")
 
         self.model_switching = False
-        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.refresh_tray()
         refresh()
         log(f"Benchmark job {job.job_id} complete")
 
@@ -719,7 +742,7 @@ class App:
             if self.benchmark_next and not superseded:
                 self.benchmark_next = False
                 self.enter_stop = False
-                self.ui.call_soon(self.ui.refresh_tray)
+                self.ui.refresh_tray()
                 downloaded = [m.name for m in self.engine.catalog() if m.downloaded]
                 if not downloaded:
                     log("Benchmark skipped: no models are downloaded")
@@ -800,7 +823,7 @@ class App:
         self.cfg.set("language", code)
         self.cfg.save()
         log(f"Language set to {code}")
-        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.refresh_tray()
         self.ui.show_notice(f"Language: {code}")
 
     def set_idle_unload(self, minutes):
@@ -817,7 +840,7 @@ class App:
             else "Idle unload disabled — model stays resident")
         if minutes > 0 and not self._idle_thread_running:
             self._start_idle_watchdog()
-        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.refresh_tray()
         self.ui.show_notice("Model stays resident" if not minutes
                             else f"Release model after {minutes} min")
 
@@ -826,7 +849,7 @@ class App:
         if paused and self.recording:
             self.stop_recording(discard=True)
         self.ui.set_tray_state("paused" if paused else "idle")
-        self.ui.call_soon(self.ui.refresh_tray)
+        self.ui.refresh_tray()
         log(f"Dictation {'paused' if paused else 'resumed'}")
 
     # ── Hotkeys ──────────────────────────────────────────────────────────

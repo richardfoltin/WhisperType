@@ -856,7 +856,13 @@ class TkUI:
 
     def _build_tray_menu(self):
         items = []
-        for info in self.app.model_catalog():
+        if self.app.model_switching:
+            # The catalogue still belongs to the outgoing engine while its
+            # replacement loads. Showing those entries would invite a click
+            # that cannot work; say what is happening instead.
+            items.append(pystray.MenuItem("Switching engine…", None, enabled=False))
+        for info in ([] if self.app.model_switching
+                     else self.app.model_catalog()):
             label = f"{info.name}\t{info.size_label}"
             if not info.downloaded:
                 label = "↓ " + label
@@ -1022,11 +1028,27 @@ class TkUI:
             self.tray_icon.icon = make_tray_icon(state)
 
     def refresh_tray(self):
-        if self.tray_icon:
+        """Rebuild the tray menu.
+
+        pystray bakes the item list into a native HMENU when the menu is
+        assigned; the callables it re-evaluates are only the per-item text and
+        state. So anything that changes *which* items exist — switching engine,
+        finishing a download — has to come through here or the menu keeps
+        showing the previous engine's models.
+
+        Safe from any thread: this touches no Tk, only app state and Win32.
+        """
+        if not self.tray_icon:
+            return
+        try:
             self.tray_icon.menu = self._build_tray_menu()
-            # Not a hardcoded "idle": rebuilding the menu during a download or
-            # a benchmark must not reset the icon that says so.
             self.tray_icon.icon = make_tray_icon(self._tray_state or "idle")
+        except Exception as e:
+            # A raise here used to vanish into the Tk callback handler and
+            # leave the menu silently frozen on its previous contents.
+            import traceback
+            log(f"Tray menu rebuild failed: {e}")
+            log(traceback.format_exc())
 
     def stop_tray(self):
         if self.tray_icon:
