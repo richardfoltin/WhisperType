@@ -66,11 +66,20 @@ class App:
 
         self.recording = False
         self.paused = False
-        self.discard_recording = False
         self.enter_stop = False
         self.stop_event = threading.Event()
         self._last_tap = 0.0
         self.shutting_down = False
+
+        # Every recording gets a generation number. Stopping one is not
+        # instantaneous — the audio thread sits in stream.read() for up to a
+        # chunk period plus the device teardown — so a quick stop-then-start
+        # leaves the old thread running while the new one begins. Without
+        # this, the dying thread cleared `recording` on the live recording and
+        # enqueued its audio against the NEW target window.
+        self._rec_gen = 0
+        self._discard_gen = -1
+        self._rec_thread = None
 
         #: Last thing that went wrong, shown until acknowledged. Without this
         #: a transcript that could not be delivered looked exactly like one
@@ -535,7 +544,6 @@ class App:
             return
         self._touch()
         self.recording = True
-        self.discard_recording = False
         self.enter_stop = False
         self.stop_event = threading.Event()
         if capture_target:
@@ -546,35 +554,49 @@ class App:
                 log(f"Could not capture target window: {e}")
                 self.target, self.target_title = None, ""
         name = self.target_title
+        self._rec_gen += 1
         self.ui.call_soon(lambda: self.ui.show_recording(name))
-        threading.Thread(target=self._record_and_enqueue, daemon=True).start()
+        # Target and stop event are passed in, not read back off self: by the
+        # time this thread finishes they may belong to a newer recording.
+        self._rec_thread = threading.Thread(
+            target=self._record_and_enqueue,
+            args=(self._rec_gen, self.stop_event, self.target, name),
+            daemon=True)
+        self._rec_thread.start()
         log(f"Recording started, target: {name or '(none)'}")
 
     def stop_recording(self, discard=False, send_enter=False):
         if not self.recording:
             return
         self.recording = False
-        self.discard_recording = discard
+        if discard:
+            self._discard_gen = self._rec_gen
         self.enter_stop = send_enter
         self.stop_event.set()
 
-    def _record_and_enqueue(self):
+    def _record_and_enqueue(self, gen, stop_ev, target, window_name):
         try:
             capture = audio.record_until_stop(
-                self.cfg, self.stop_event,
+                self.cfg, stop_ev,
                 level_callback=self.ui.push_level,
                 on_first_chunk=self.ui.on_capture_started)
             data = capture.data
-            target = self.target
-            window_name = self.target_title
-            self.recording = False
             self._touch()
 
-            if not data or self.discard_recording:
-                self.discard_recording = False
-                self.enter_stop = False
-                if not self.ui.history_mode:
-                    self.ui.call_soon(self.ui.on_recording_stopped)
+            # A newer recording may have started while we drained out of
+            # stream.read(). This thread then owns none of the shared state
+            # and must not drive the overlay — but it still owns its audio.
+            superseded = gen != self._rec_gen
+            discarded = gen == self._discard_gen
+
+            if not superseded:
+                self.recording = False
+
+            if not data or discarded:
+                if not superseded:
+                    self.enter_stop = False
+                    if not self.ui.history_mode:
+                        self.ui.call_soon(self.ui.on_recording_stopped)
                 log("Recording discarded" if data else "No audio captured")
                 return
 
@@ -582,10 +604,11 @@ class App:
             # Whisper reliably invents a stock phrase for silence, and that
             # phrase would be typed into whatever the user is working on.
             if capture.speech_seconds < self.cfg.min_speech_seconds:
-                self.enter_stop = False
+                if not superseded:
+                    self.enter_stop = False
+                    self.ui.call_soon(lambda: self.ui.show_notice("Nothing heard"))
                 log(f"Nothing heard ({capture.speech_seconds:.2f}s above "
                     f"threshold) — clip dropped")
-                self.ui.call_soon(lambda: self.ui.show_notice("Nothing heard"))
                 return
 
             duration = len(data) / (self.cfg.rate * 2)   # 16-bit mono
@@ -594,7 +617,14 @@ class App:
             except Exception:
                 app_name = "?"
 
-            if self.benchmark_next:
+            if superseded:
+                # The Enter flag and the benchmark arming belong to whichever
+                # recording is live now. This clip is still transcribed — being
+                # replaced is not a reason to throw away something already said.
+                log(f"Recording {gen} was superseded by {self._rec_gen} — "
+                    f"transcribing its audio anyway")
+
+            if self.benchmark_next and not superseded:
                 self.benchmark_next = False
                 self.enter_stop = False
                 self.ui.call_soon(self.ui.refresh_tray)
@@ -618,8 +648,11 @@ class App:
                 self.ui.set_tray_state("transcribing")
                 return
 
-            send_enter = self.enter_stop
-            self.enter_stop = False
+            if superseded:
+                send_enter = False
+            else:
+                send_enter = self.enter_stop
+                self.enter_stop = False
             job = TranscriptionJob(
                 job_id=self.jobs.next_id(),
                 audio_bytes=data,
@@ -632,14 +665,19 @@ class App:
 
             # Schedule the overlay update before queuing, so a very fast worker
             # cannot clear the job before the UI has processed the transition.
-            self.ui.call_soon(self.ui.on_recording_stopped)
+            # Skipped when superseded: on_recording_stopped would cancel the
+            # timers of the recording that is actually live.
+            self.ui.call_soon(self.ui.refresh if superseded
+                              else self.ui.on_recording_stopped)
             self.jobs.submit(job)
             log(f"Enqueued job {job.job_id} for '{window_name}' ({duration:.1f}s)")
-            self.ui.set_tray_state("transcribing")
+            if not superseded:
+                self.ui.set_tray_state("transcribing")
         except Exception as e:
-            self.recording = False
+            if gen == self._rec_gen:
+                self.recording = False
+                self.ui.call_soon(self.ui.on_recording_stopped)
             self.set_error(f"Recording failed: {e}")
-            self.ui.call_soon(self.ui.on_recording_stopped)
 
     # ── History mode ─────────────────────────────────────────────────────
 
