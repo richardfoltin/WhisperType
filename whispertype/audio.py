@@ -105,22 +105,57 @@ def backend():
     return _backend
 
 
-def record_until_stop(cfg, stop_event, level_callback=None):
+class Capture:
+    """Result of one recording."""
+
+    __slots__ = ("data", "speech_seconds")
+
+    def __init__(self, data, speech_seconds):
+        self.data = data
+        self.speech_seconds = speech_seconds
+
+
+def warm_up(cfg):
+    """Open and immediately close a capture stream.
+
+    Opening a CoreAudio input stream is not free — the device has to be
+    configured and, at 16 kHz on a 48 kHz mic, a sample-rate converter set up.
+    Doing that lazily inside the recorder thread meant the overlay said
+    "Recording" seconds before any audio was actually flowing, so the first
+    sentence of each session was clipped. Paying the cost at startup also moves
+    the microphone permission prompt to launch time instead of mid-dictation.
+    """
+    t0 = time.time()
+    dev = backend().resolve_device(cfg.input_device)
+    stream = backend().open(cfg.rate, cfg.chunk, device=dev)
+    stream.close()
+    log(f"Audio device warm ({time.time() - t0:.2f}s)")
+
+
+def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None):
     """Record until stopped, silent for cfg.silence_duration, or timed out.
 
-    Returns raw 16-bit mono PCM bytes, or None if nothing was captured.
+    `on_first_chunk` fires once, when audio is genuinely flowing, so the UI can
+    start its timer from that instant rather than from the keypress.
     """
     dev = backend().resolve_device(cfg.input_device)
     stream = backend().open(cfg.rate, cfg.chunk, device=dev)
     frames = []
     silence_since = None
+    speech_seconds = 0.0
+    first = True
     start = time.time()
     threshold = cfg.silence_threshold
     max_secs = cfg.max_recording_time
     silence_secs = cfg.silence_duration
+    chunk_seconds = cfg.chunk / float(cfg.rate)
     try:
         while not stop_event.is_set():
             data = stream.read()
+            if first:
+                first = False
+                if on_first_chunk:
+                    on_first_chunk()
             frames.append(data)
             arr = np.frombuffer(data, np.int16).astype(np.float64)
             rms = float(np.sqrt(np.mean(arr ** 2))) if len(arr) > 0 else 0.0
@@ -133,6 +168,7 @@ def record_until_stop(cfg, stop_event, level_callback=None):
                     break
             else:
                 silence_since = None
+                speech_seconds += chunk_seconds
             if time.time() - start > max_secs:
                 break
     finally:
@@ -140,4 +176,4 @@ def record_until_stop(cfg, stop_event, level_callback=None):
             stream.close()
         except Exception as e:
             log(f"Error closing audio stream: {e}")
-    return b"".join(frames) if frames else None
+    return Capture(b"".join(frames) if frames else None, speech_seconds)

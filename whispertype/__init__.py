@@ -3,7 +3,7 @@
 Windows and macOS share everything except the input/window layer
 (`whispertype.backends`) and the overlay/tray layer (`whispertype.ui`).
 """
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 def main():

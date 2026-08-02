@@ -27,6 +27,17 @@ DEFAULTS = {
     "silence_duration": 3.0,
     "max_recording_time": 300.0,
     "last_model": "large-v3-turbo",
+    #: Capture device: null = system default, an int index, or a name substring.
+    "input_device": None,
+    #: Release the model after this many idle minutes (0 disables). Reloading
+    #: from the local cache measures about a second.
+    "idle_unload_minutes": 10,
+    #: A clip whose level never stayed above silence_threshold for this long is
+    #: discarded rather than transcribed — otherwise Whisper invents a sentence
+    #: for silence and types it wherever the user is working.
+    "min_speech_seconds": 0.25,
+    #: "auto" follows the system appearance; "dark" / "light" pin it.
+    "theme": "auto",
 }
 
 
@@ -88,6 +99,28 @@ class Config:
         the built-in mic so opening the stream does not drag Bluetooth
         headphones into their low-quality HFP profile)."""
         return self.get("input_device", None)
+
+    @property
+    def idle_unload_seconds(self):
+        try:
+            minutes = float(self.get("idle_unload_minutes",
+                                     DEFAULTS["idle_unload_minutes"]))
+        except (TypeError, ValueError):
+            minutes = DEFAULTS["idle_unload_minutes"]
+        return max(0.0, minutes) * 60.0
+
+    @property
+    def min_speech_seconds(self):
+        try:
+            return max(0.0, float(self.get("min_speech_seconds",
+                                           DEFAULTS["min_speech_seconds"])))
+        except (TypeError, ValueError):
+            return DEFAULTS["min_speech_seconds"]
+
+    @property
+    def theme(self):
+        value = str(self.get("theme", "auto")).lower()
+        return value if value in ("auto", "dark", "light") else "auto"
 
 
 def load():

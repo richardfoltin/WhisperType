@@ -16,6 +16,41 @@
     --mono: ui-monospace, "SF Mono", Menlo, monospace;
   }
 
+  /* Light appearance. `data-theme` is set from the config when it is not
+     "auto", and wins over the system preference in both directions. */
+  :root[data-theme="light"],
+  :root[data-theme="auto"]:where(.light-preferred) {
+    --bg:      #f8fafc;
+    --text:    #0f172a;
+    --dim:     #64748b;
+    --bar-bg:  #e2e8f0;
+    --bar-lo:  #059669;
+    --bar-mid: #d97706;
+    --bar-hi:  #dc2626;
+    --gpu-fill:#d1fae5;
+    --sep:     #cbd5e1;
+    --rec:     #dc2626;
+    --trans:   #d97706;
+    --danger:  #dc2626;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg:      #f8fafc;
+      --text:    #0f172a;
+      --dim:     #64748b;
+      --bar-bg:  #e2e8f0;
+      --bar-lo:  #059669;
+      --bar-mid: #d97706;
+      --bar-hi:  #dc2626;
+      --gpu-fill:#d1fae5;
+      --sep:     #cbd5e1;
+      --rec:     #dc2626;
+      --trans:   #d97706;
+      --danger:  #dc2626;
+    }
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   html, body {
@@ -64,6 +99,17 @@
   #level-canvas { display: block; width: 352px; height: 24px; margin: 4px 0 2px 0; }
   #hint { color: var(--dim); font-size: 11px; padding: 2px 0 6px 0; }
 
+  /* The only place a failure is ever explained. */
+  #message {
+    color: var(--text); font-size: 12px; line-height: 1.35;
+    padding: 4px 8px; margin: 4px 0 2px 0;
+    border-left: 3px solid var(--danger); background: var(--bar-bg);
+    border-radius: 0 4px 4px 0;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #message.notice { border-left-color: var(--dim); color: var(--dim); }
+  #message.loading { border-left-color: var(--trans); color: var(--dim); }
+
   /* ── Tables (queue + history) ── */
   .table { padding: 0 14px 6px 14px; }
   .thead, .row {
@@ -88,7 +134,22 @@
 
   #queue-more { color: var(--dim); font-family: var(--mono); font-size: 11px; height: 18px; }
 
-  #hist-scroll { max-height: 176px; overflow-y: auto; overflow-x: hidden; }
+  /* A history row that shows only time/app/window is useless for choosing
+     which transcript to copy — three dictations into the same app look
+     identical. The text goes inline, clamped, and stays selectable. */
+  .hist-item { padding-bottom: 4px; }
+  .hist-item + .hist-item { border-top: 1px solid var(--sep); padding-top: 3px; }
+  .hist-text {
+    color: var(--text); font-size: 11px; line-height: 1.4;
+    padding: 0 0 2px 2px;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+    overflow: hidden;
+    user-select: text; -webkit-user-select: text; cursor: text;
+  }
+  .hist-item.open .hist-text { -webkit-line-clamp: unset; }
+  .hist-text:empty { display: none; }
+
+  #hist-scroll { max-height: 240px; overflow-y: auto; overflow-x: hidden; }
   #hist-scroll::-webkit-scrollbar { width: 6px; }
   #hist-scroll::-webkit-scrollbar-thumb { background: var(--sep); border-radius: 3px; }
   #hist-empty { color: var(--dim); font-size: 11px; height: 22px; line-height: 22px; }
@@ -131,6 +192,7 @@
       <span id="target"></span>
     </div>
     <canvas id="level-canvas" width="704" height="48"></canvas>
+    <div id="message" class="hidden"></div>
     <div id="hint"></div>
   </section>
 
@@ -163,11 +225,24 @@
     try { window.webkit.messageHandlers.wt.postMessage(msg); } catch (e) {}
   };
 
-  const C = {
-    barBg: "#1e293b", barLo: "#6ee7b7", barMid: "#fbbf24", barHi: "#f87171",
-    gpuFill: "#1a3a2a", grid: "#1e293b", danger: "#ef4444", bg: "#0f172a",
-    dim: "#64748b", text: "#f1f5f9", rec: "#f87171", trans: "#fbbf24",
-  };
+  // Canvases cannot use CSS variables, so read the resolved values. Recomputed
+  // whenever the appearance changes so the graphs follow light/dark mode.
+  let C = {};
+  function readColors() {
+    const s = getComputedStyle(document.documentElement);
+    const v = (n, fallback) => (s.getPropertyValue(n).trim() || fallback);
+    C = {
+      bg: v("--bg", "#0f172a"), barBg: v("--bar-bg", "#1e293b"),
+      barLo: v("--bar-lo", "#6ee7b7"), barMid: v("--bar-mid", "#fbbf24"),
+      barHi: v("--bar-hi", "#f87171"), gpuFill: v("--gpu-fill", "#1a3a2a"),
+      danger: v("--danger", "#ef4444"), dim: v("--dim", "#64748b"),
+      text: v("--text", "#f1f5f9"), rec: v("--rec", "#f87171"),
+      trans: v("--trans", "#fbbf24"), grid: v("--sep", "#334155"),
+    };
+  }
+  readColors();
+  const mq = window.matchMedia("(prefers-color-scheme: light)");
+  mq.addEventListener("change", () => { readColors(); drawGpu(); drawLevel(); });
 
   const DPR = 2;                 // canvases are declared at 2x
   const GPU_WINDOW = 60;         // samples the graph is scaled against
@@ -263,6 +338,11 @@
   const api = {
     setState(s) {
       Object.assign(state, s);
+      if (s.theme) {
+        document.documentElement.dataset.theme = s.theme;
+        readColors();
+        drawGpu();
+      }
       const dot = $("dot"), st = $("state");
       $("gpu").classList.toggle("hidden", !state.gpuAvailable);
       $("gpu-label").textContent = state.gpuLabel || "GPU";
@@ -270,11 +350,20 @@
       $("target").textContent = state.target ? `→ ${state.target}` : "";
       $("hint").textContent = state.hint || "";
 
+      const msg = $("message");
+      msg.textContent = state.message || "";
+      msg.className = state.message
+        ? (state.mode === "error" ? "" : state.mode)
+        : "hidden";
+
       const M = {
-        recording:    { color: C.rec,   label: "Recording" },
-        transcribing: { color: C.trans, label: "Transcribing" },
-        history:      { color: C.barLo, label: "History" },
-        idle:         { color: C.dim,   label: "Ready" },
+        recording:    { color: C.rec,    label: "Recording" },
+        transcribing: { color: C.trans,  label: "Transcribing" },
+        history:      { color: C.barLo,  label: "History" },
+        error:        { color: C.danger, label: "Failed" },
+        notice:       { color: C.dim,    label: "Ready" },
+        loading:      { color: C.trans,  label: "Loading" },
+        idle:         { color: C.dim,    label: "Ready" },
       }[state.mode] || { color: C.dim, label: "Ready" };
 
       dot.style.color = M.color;
@@ -339,17 +428,29 @@
       }
       // Newest first; index is into the original (oldest-first) list.
       items.slice().reverse().forEach((it) => {
+        const item = document.createElement("div");
+        item.className = "hist-item";
+
         const row = document.createElement("div");
         row.className = "row hist";
         row.append(span(it.ts), span(it.dur), span(it.app), span(it.window));
         const btns = document.createElement("span");
         btns.className = "btns";
-        const copy = btn("copy", "\u{1F4CB}", () => post({ action: "copy", text: it.text }));
-        attachTooltip(copy, it.text.slice(0, 500) + (it.text.length > 500 ? "…" : ""));
-        btns.append(copy);
+        btns.append(btn("copy", "\u{1F4CB}", () => post({ action: "copy", text: it.text })));
         btns.append(btn("del", "×", () => post({ action: "deleteHistory", index: it.index })));
         row.append(btns);
-        box.append(row);
+
+        const text = document.createElement("div");
+        text.className = "hist-text";
+        text.textContent = it.text || "";
+        // Clamped to three lines; click the meta row to expand a long one.
+        row.addEventListener("click", () => {
+          item.classList.toggle("open");
+          report();
+        });
+
+        item.append(row, text);
+        box.append(item);
       });
       report();
     },

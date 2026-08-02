@@ -1,11 +1,21 @@
 """Transcription queue, job records and history — platform independent."""
+import json
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
+
+from .log import log
 
 MAX_HISTORY = 50
+
+#: History is where a transcript lands when it cannot be typed (target app
+#: gone, secure input, permission revoked), so it has to survive a quit and a
+#: login — otherwise the documented fallback loses exactly the text the user
+#: most needs to recover.
+HISTORY_PATH = Path.home() / ".whispertype" / "history.json"
 
 
 class JobStatus(Enum):
@@ -24,6 +34,13 @@ class ModelSwitch:
     mid-queue impossible by construction.
     """
     name: str
+
+
+@dataclass
+class ModelUnload:
+    """Control message: release the model to reclaim memory after an idle
+    period. Goes through the queue for the same reason ModelSwitch does — MLX
+    will not let another thread free what the worker allocated."""
 
 
 @dataclass
@@ -121,11 +138,36 @@ class JobQueue:
 
     # ── History ──
 
+    def load_history(self, path=HISTORY_PATH):
+        self._history_path = path
+        try:
+            if path.exists():
+                with open(path, encoding="utf-8") as f:
+                    items = json.load(f)
+                if isinstance(items, list):
+                    with self._history_lock:
+                        self._history = [i for i in items if isinstance(i, dict)][-MAX_HISTORY:]
+                    log(f"Loaded {len(self._history)} history entries")
+        except Exception as e:
+            log(f"Could not read history ({e}) — starting empty")
+
+    def _save_history(self):
+        path = getattr(self, "_history_path", HISTORY_PATH)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._history, f, ensure_ascii=False, indent=1)
+            tmp.replace(path)          # atomic: a crash cannot truncate history
+        except Exception as e:
+            log(f"Could not save history: {e}")
+
     def add_history(self, entry):
         with self._history_lock:
             self._history.append(entry)
             if len(self._history) > MAX_HISTORY:
                 self._history.pop(0)
+            self._save_history()
 
     def history(self):
         with self._history_lock:
@@ -139,3 +181,9 @@ class JobQueue:
         with self._history_lock:
             if 0 <= idx < len(self._history):
                 self._history.pop(idx)
+                self._save_history()
+
+    def clear_history(self):
+        with self._history_lock:
+            self._history = []
+            self._save_history()

@@ -75,6 +75,24 @@ class WhisperEngine:
         self._name = name
         log(f"{name} ready on {self.device}.")
 
+    @property
+    def loaded(self):
+        return self._model is not None
+
+    def unload(self):
+        if self._model is None:
+            return
+        self._model = None
+        try:
+            import gc
+            import torch
+            gc.collect()
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        log("Model released (idle)")
+
     def transcribe(self, audio_bytes, language):
         audio_np = pcm_to_float32(audio_bytes)
         result = self._whisper.transcribe(self._model, audio_np,
@@ -150,7 +168,32 @@ class MlxEngine:
         self._name = name
         log(f"{name} ready on Metal.")
 
+    @property
+    def loaded(self):
+        return self._holder.model is not None
+
+    def unload(self):
+        """Drop the ~1.6 GB of resident weights.
+
+        mlx_whisper keeps exactly one model in ModelHolder, so clearing both
+        class attributes is what actually releases it; mx.clear_cache() then
+        returns the Metal buffer pool to the system.
+        """
+        if self._holder.model is None:
+            return
+        self._holder.model = None
+        self._holder.model_path = None
+        try:
+            import gc
+            gc.collect()
+            self._mx.clear_cache()
+        except Exception:
+            pass
+        log("Model released (idle)")
+
     def transcribe(self, audio_bytes, language):
+        if not self.loaded:                 # reloaded on demand after an unload
+            self.load(self._name)
         audio_np = pcm_to_float32(audio_bytes)
         result = self._mlx_whisper.transcribe(
             audio_np,

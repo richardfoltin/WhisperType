@@ -14,6 +14,8 @@ constraints drive that choice:
 Every method below may be called from any thread; the ones the worker/recorder
 threads reach for marshal themselves onto the main queue.
 """
+import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -30,12 +32,36 @@ from AppKit import (
 from Foundation import NSMakeRect, NSObject, NSOperationQueue, NSTimer
 from WebKit import WKWebView, WKWebViewConfiguration
 
+from .. import __version__
 from ..icon import png_bytes
 from ..jobs import JobStatus
-from ..log import log
+from ..log import LOG_PATH, log
 
 OV_W = 380
 HTML_PATH = Path(__file__).with_name("overlay.html")
+
+#: Offered in the Language submenu. `language` is read fresh for every job, so
+#: switching takes effect on the next dictation with no restart.
+LANGUAGES = [
+    ("hu", "Magyar"), ("en", "English"), ("de", "Deutsch"),
+    ("fr", "Français"), ("es", "Español"), ("it", "Italiano"),
+    ("nl", "Nederlands"), ("pl", "Polski"), ("ja", "日本語"),
+]
+
+
+def _input_device_names():
+    try:
+        import sounddevice as sd
+        seen, names = set(), []
+        for dev in sd.query_devices():
+            name = dev["name"]
+            if dev["max_input_channels"] > 0 and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+    except Exception as e:
+        log(f"Could not enumerate input devices: {e}")
+        return []
 
 
 # ── AppKit subclasses ────────────────────────────────────────────────────────
@@ -79,6 +105,31 @@ class Bridge(NSObject):
     def modelSelected_(self, sender):
         self._ui.app.request_model(str(sender.representedObject()))
 
+    def languageSelected_(self, sender):
+        # Read fresh per job (app._handle_job), so this needs no restart.
+        self._ui.app.cfg.set("language", str(sender.representedObject()))
+        self._ui.app.cfg.save()
+        self._ui.refresh_tray()
+
+    def micSelected_(self, sender):
+        # Resolved per recording (audio.record_until_stop), also no restart.
+        value = sender.representedObject()
+        self._ui.app.cfg.set("input_device", None if value is None else str(value))
+        self._ui.app.cfg.save()
+        self._ui.refresh_tray()
+
+    def historySelected_(self, sender):
+        self._ui.app.show_history()
+
+    def pauseSelected_(self, sender):
+        self._ui.app.set_paused(not self._ui.app.paused)
+
+    def openLogSelected_(self, sender):
+        self._ui.open_log()
+
+    def restartSelected_(self, sender):
+        self._ui.restart()
+
     def exitSelected_(self, sender):
         self._ui.app.quit()
 
@@ -98,6 +149,8 @@ class AppKitUI:
         self._last_level = 0.0
         self._tray_state = None
         self._gpu_timer = None
+        self._notice = None         # transient message, e.g. "Nothing heard"
+        self._loading = None        # model name while it is being loaded
 
         self._ns = NSApplication.sharedApplication()
         # Accessory: menu-bar only, no Dock icon, never becomes frontmost.
@@ -239,29 +292,83 @@ class AppKitUI:
             return "history"
         if self.app.jobs.busy():
             return "transcribing"
+        if self.app.last_error:
+            return "error"
+        if self._notice:
+            return "notice"
+        if self._loading:
+            return "loading"
         return "idle"
 
     def _hint(self, mode):
         k = self.app.ptt_label
         if mode == "recording":
-            return f"Transcribe: {k} / Enter↵ / {self.app.cfg.silence_duration:.0f}s silence  |  History: Space  |  Hide: Esc"
+            return (f"Transcribe: {k} / Enter↵ / "
+                    f"{self.app.cfg.silence_duration:.0f}s silence"
+                    f"  |  History: Space  |  Hide: Esc")
         if mode == "history":
-            return "Record: Space  |  Hide: Esc"
-        return f"Record: Double {k}  |  History: Space  |  Hide: Esc"
+            return "Back: Space  |  Hide: Esc"
+        if mode == "error":
+            return "Dismiss: Esc  |  History: menu bar ▸ History"
+        return f"Record: Double {k}  |  Hide: Esc"
 
     def _push_state(self, rec_start=None, target=None):
         mode = self._mode()
+        message = ""
+        if mode == "error":
+            message = str(self.app.last_error)
+        elif mode == "notice":
+            message = self._notice
+        elif mode == "loading":
+            message = f"Loading {self._loading}…"
         state = {
             "mode": mode,
             "model": self.app.model_name,
             "target": target if target is not None else "",
             "hint": self._hint(mode),
+            "message": message,
+            "theme": self.app.cfg.theme,
             "gpuAvailable": bool(self.app.backend.gpu_available),
             "gpuLabel": self.app.backend.gpu_label,
         }
         if rec_start is not None:
             state["recStart"] = int(rec_start * 1000)
         self._js(f"wt.setState({_json(state)}); wt.setMode({_json(mode)});")
+
+    # ── Transient states ──
+
+    def on_capture_started(self):
+        """Called from the recorder thread the moment audio actually flows.
+
+        Opening the CoreAudio stream takes long enough that starting the timer
+        at the keypress made the overlay claim to be recording before it was.
+        """
+        self.call_soon(lambda: self._js(
+            f"wt.setState({{\"recStart\": {int(time.time() * 1000)}}});"))
+
+    def show_notice(self, text, seconds=1.6):
+        """Briefly show a message (e.g. 'Nothing heard') and then fall back to
+        whatever state the app is really in."""
+        def run():
+            self._notice = text
+            self._push_state()
+            self._show()
+
+            def clear():
+                self._notice = None
+                self._refresh_main()
+            self.call_later(int(seconds * 1000), clear)
+        self.call_soon(run)
+
+    def show_loading(self, model_name):
+        def run():
+            self._loading = model_name
+            self._push_state()
+            self._show()
+        self.call_soon(run)
+
+    def clear_loading(self):
+        self._loading = None
 
     def _push_queue(self):
         items = [{
@@ -317,7 +424,8 @@ class AppKitUI:
         self.call_soon(self._refresh_main)
 
     def _refresh_main(self):
-        if self.app.recording or self.app.jobs.busy() or self.history_mode:
+        if (self.app.recording or self.app.jobs.busy() or self.history_mode
+                or self.app.last_error or self._notice or self._loading):
             self._push_state()
             self._push_queue()
             if self.history_mode:
@@ -327,7 +435,11 @@ class AppKitUI:
             self.hide()
 
     def check_hide(self):
-        if not self.app.jobs.busy() and not self.app.recording and not self.history_mode:
+        # An unacknowledged error keeps the overlay up: it is the only place
+        # the reason is written down.
+        if (not self.app.jobs.busy() and not self.app.recording
+                and not self.history_mode and not self.app.last_error
+                and not self._notice and not self._loading):
             self.hide()
 
     def set_history_mode(self, on):
@@ -386,36 +498,97 @@ class AppKitUI:
     def refresh_tray(self):
         self.call_soon(self._rebuild_menu)
 
+    def _item(self, menu, title, action=None, obj=None, state=0, enabled=True):
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            title, action, "")
+        if action:
+            item.setTarget_(self._bridge)
+        if obj is not None:
+            item.setRepresentedObject_(obj)
+        item.setState_(state)
+        item.setEnabled_(enabled)
+        menu.addItem_(item)
+        return item
+
+    def _submenu(self, menu, title):
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+        sub = NSMenu.alloc().init()
+        parent.setSubmenu_(sub)
+        menu.addItem_(parent)
+        return sub
+
     def _rebuild_menu(self):
+        if self.app.model_ready:
+            self._loading = None
+        app = self.app
         menu = NSMenu.alloc().init()
-        header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("WhisperType", None, "")
-        header.setEnabled_(False)
-        menu.addItem_(header)
+
+        # The hotkey used to be written only on the overlay — which you can
+        # only open by pressing the hotkey you are trying to look up.
+        self._item(menu, f"WhisperType {__version__}", enabled=False)
+        self._item(menu, f"Record: double-tap {app.ptt_label}", enabled=False)
+        if app.last_error:
+            self._item(menu, f"⚠ {str(app.last_error)[:60]}", enabled=False)
+        elif not app.model_ready:
+            self._item(menu, f"Loading {app.model_name}…", enabled=False)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._item(menu, "History…", "historySelected:")
+        self._item(menu, "Pause dictation", "pauseSelected:",
+                   state=1 if app.paused else 0)
+
         menu.addItem_(NSMenuItem.separatorItem())
 
-        models_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Model", None, "")
-        submenu = NSMenu.alloc().init()
-        for info in self.app.model_catalog():
+        models = self._submenu(menu, "Model")
+        for info in app.model_catalog():
             label = f"{info.name}   {info.size_label}"
             if not info.downloaded:
                 label = "↓ " + label
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                label, "modelSelected:", "")
-            item.setTarget_(self._bridge)
-            item.setRepresentedObject_(info.name)
-            item.setState_(1 if info.name == self.app.model_name else 0)
-            submenu.addItem_(item)
-        models_item.setSubmenu_(submenu)
-        menu.addItem_(models_item)
+            self._item(models, label, "modelSelected:", obj=info.name,
+                       state=1 if info.name == app.model_name else 0)
+
+        langs = self._submenu(menu, "Language")
+        current_lang = app.cfg.language
+        for code, name in LANGUAGES:
+            self._item(langs, name, "languageSelected:", obj=code,
+                       state=1 if code == current_lang else 0)
+
+        mics = self._submenu(menu, "Microphone")
+        current_mic = app.cfg.input_device
+        self._item(mics, "System default", "micSelected:", obj=None,
+                   state=1 if not current_mic else 0)
+        for name in _input_device_names():
+            self._item(mics, name, "micSelected:", obj=name,
+                       state=1 if current_mic and str(current_mic) in name else 0)
 
         menu.addItem_(NSMenuItem.separatorItem())
-        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Exit", "exitSelected:", "")
-        quit_item.setTarget_(self._bridge)
-        menu.addItem_(quit_item)
+        self._item(menu, "Open Log", "openLogSelected:")
+        self._item(menu, "Restart WhisperType", "restartSelected:")
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._item(menu, "Exit", "exitSelected:")
 
         self._status.setMenu_(menu)
         self._apply_tray_state(self._tray_state or "idle")
+
+    # ── Menu actions that touch the system ──
+
+    def open_log(self):
+        subprocess.Popen(["/usr/bin/open", "-a", "Console", str(LOG_PATH)])
+
+    def restart(self):
+        """Ask launchd to restart us. Falls back to a plain exit when the app
+        was started by hand, in which case there is nothing to restart into."""
+        label = f"gui/{os.getuid()}/com.whispertype.agent"
+        try:
+            probe = subprocess.run(["/bin/launchctl", "print", label],
+                                   capture_output=True)
+            if probe.returncode != 0:
+                log("Restart requested but no LaunchAgent is loaded — quitting")
+                self.app.quit()
+                return
+            subprocess.Popen(["/bin/launchctl", "kickstart", "-k", label])
+        except Exception as e:
+            log(f"Restart failed: {e}")
 
     def stop_tray(self):
         def drop():

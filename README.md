@@ -47,6 +47,18 @@ The installer creates a virtualenv in `~/.whispertype/venv`, installs the MLX st
 
 Missing grants are written to `voice_daemon.log` on every startup.
 
+To update, pull and re-run the installer — it is safe to run any time:
+
+```bash
+git pull && ./install_mac.sh
+```
+
+To remove everything it created:
+
+```bash
+./uninstall_mac.sh
+```
+
 ---
 
 ## How to Use
@@ -56,11 +68,13 @@ Missing grants are written to `voice_daemon.log` on every startup.
 | Start recording | **Double-tap Right Ctrl** (within 400ms) |
 | Stop recording | **Right Ctrl** (single tap) |
 | Auto-stop | 3 seconds of silence |
-| Open history | **Space** (while overlay is visible) |
-| Resume recording | **Space** (while in history) |
-| Quit | **Esc** (while overlay is visible) |
-| Switch model | Right-click tray icon > Model |
-| Exit | Right-click tray icon > Exit |
+| Open history | **Space** (while recording), or the menu bar |
+| Leave history | **Space** |
+| Hide overlay | **Esc** |
+| Switch model | Tray / menu bar ▸ Model |
+| Exit | Tray / menu bar ▸ Exit |
+
+Space and Esc are only intercepted while you are actually recording or in history — they behave normally in your other apps the rest of the time, including while a transcription is still running.
 
 1. Double-tap **Right Ctrl** to start recording — a floating overlay appears
 2. Speak naturally
@@ -124,6 +138,38 @@ Press **Space** again to close history and start a new recording. If you were re
 
 ---
 
+## The menu bar (macOS)
+
+Everything you need day to day is in the menu-bar menu, so you never have to
+edit JSON for the common cases:
+
+| Item | Notes |
+|---|---|
+| **History…** | Opens the history list without starting a recording |
+| **Pause dictation** | Ignores the hotkey until you switch it back; the icon shows a struck-through mic |
+| **Model** | Runtime switch. `↓` means not downloaded yet |
+| **Language** | Takes effect on the very next dictation, no restart |
+| **Microphone** | Same. Pin the built-in mic here so recording does not drop AirPods into call quality |
+| **Open Log** | Opens `voice_daemon.log` in Console |
+| **Restart WhisperType** | Needed only after changing the hotkey |
+
+The icon colour is the app's status at a glance: green ready, red recording,
+amber transcribing, grey downloading or loading, **red exclamation mark** when
+something failed, struck-through when paused.
+
+## When something goes wrong
+
+A transcript that cannot be delivered is never silently dropped. The overlay
+stays on screen with the reason, the menu-bar icon turns into a red exclamation
+mark, and the text is kept in history so you can copy it. Press **Esc** to
+dismiss. This covers: the target app quit, a password field took secure input,
+the Accessibility permission was revoked, the microphone was unavailable, the
+model failed to load, or transcription itself threw.
+
+History is written to `~/.whispertype/history.json`, so it survives quitting and
+logging out — which matters precisely because it is where undeliverable text
+ends up.
+
 ## Model Switching
 
 Right-click the tray icon and go to **Model** to see all available Whisper models:
@@ -159,6 +205,15 @@ Edit `%USERPROFILE%\.whispertype\config.json` (Windows) or `~/.whispertype/confi
 | `silence_threshold` | `200` | Audio level below this = silence (0-32768) |
 | `silence_duration` | `3.0` | Seconds of silence before auto-stop |
 | `max_recording_time` | `300.0` | Maximum recording length in seconds |
+| `min_speech_seconds` | `0.25` | A clip with less speech than this is discarded instead of transcribed. Whisper reliably invents a sentence for silence, and an accidental double-tap would otherwise type it into your document. |
+| `idle_unload_minutes` | `10` | Release the model after this many idle minutes (`0` = keep it resident). Measured: 1799 MB → 260 MB, and reloading from the local cache takes about a second. |
+| `theme` | `"auto"` | Overlay appearance: `auto` follows the system, or pin it with `dark` / `light`. |
+
+Everything except `push_to_talk_key` takes effect on the next dictation — `language` and `input_device` are re-read per job, so the menu-bar submenus change them with no restart at all. The hotkey is read once at startup, so changing it needs:
+
+```bash
+launchctl kickstart -k gui/$UID/com.whispertype.agent
+```
 
 ---
 
@@ -255,12 +310,15 @@ WhisperType/
   whispertype.pyw           Windows launcher (pythonw, no console)
   main.py                   macOS launcher (used by the .app bundle)
   install.bat               Windows installer
-  install_mac.sh            macOS installer
+  install_mac.sh            macOS installer (also the updater)
+  uninstall_mac.sh          macOS uninstaller
   setup_mac.py              py2app bundle definition
   requirements.txt          Windows dependencies
   requirements-mac.txt      macOS dependencies
-  voice_daemon.log          Runtime log (created on each launch)
+  voice_daemon.log          Runtime log (rolls over at 1 MB, keeps one backup)
 ```
+
+State lives in `~/.whispertype/`: `config.json`, `history.json` and the venv.
 
 The overlay is rebuilt from scratch on macOS rather than shared. Tk cannot be used there: its `XMapWindow` calls `[NSApp activateIgnoringOtherApps:]` on every window map, so the overlay would steal focus from the very window the transcript is about to be typed into.
 

@@ -34,6 +34,7 @@ class TkUI:
         self.app = app
         self.visible = False
         self.history_mode = False
+        self._message = None        # transient notice / loading text
 
         self.root = tk.Tk()
         self.root.attributes("-alpha", 0.0)
@@ -235,17 +236,27 @@ class TkUI:
             self.dot.config(fg=self.C["bar_lo"])
             self.state_lbl.config(text="History", fg=self.C["bar_lo"])
             self.timer.config(text="")
-            self.hint.config(text="Record: Space  |  Hide: Esc")
+            self.hint.config(text="Back: Space  |  Hide: Esc")
+        elif self.app.last_error:
+            self.dot.config(fg="#ef4444")
+            self.state_lbl.config(text="Failed", fg="#ef4444")
+            self.timer.config(text="")
+            self.hint.config(text=str(self.app.last_error))
+        elif self._message:
+            self.dot.config(fg=self.C["dim"])
+            self.state_lbl.config(text="Ready", fg=self.C["dim"])
+            self.timer.config(text="")
+            self.hint.config(text=self._message)
         elif self.app.jobs.busy():
             self.dot.config(fg=self.C["trans"])
             self.state_lbl.config(text="Transcribing", fg=self.C["trans"])
             self.timer.config(text="")
-            self.hint.config(text=f"Record: Double {k}  |  History: Space  |  Hide: Esc")
+            self.hint.config(text=f"Record: Double {k}  |  Hide: Esc")
         else:
             self.dot.config(fg=self.C["dim"])
             self.state_lbl.config(text="Ready", fg=self.C["dim"])
             self.timer.config(text="")
-            self.hint.config(text=f"Record: Double {k}  |  History: Space  |  Hide: Esc")
+            self.hint.config(text=f"Record: Double {k}  |  Hide: Esc")
 
     def _calc_height(self):
         h = 20
@@ -301,7 +312,8 @@ class TkUI:
             self.hide()
 
     def refresh(self):
-        if self.app.recording or self.app.jobs.busy() or self.history_mode:
+        if (self.app.recording or self.app.jobs.busy() or self.history_mode
+                or self.app.last_error or self._message):
             if not self.app.recording:
                 self._show_rec_idle()
             if self.history_mode:
@@ -311,8 +323,35 @@ class TkUI:
             self.hide()
 
     def check_hide(self):
-        if not self.app.jobs.busy() and not self.app.recording and not self.history_mode:
+        # An unacknowledged error keeps the overlay up — it is the only place
+        # the reason is written down.
+        if (not self.app.jobs.busy() and not self.app.recording
+                and not self.history_mode and not self.app.last_error
+                and not self._message):
             self.hide()
+
+    # ── Transient states (mirrors the macOS UI's contract) ──
+
+    def on_capture_started(self):
+        """Audio is genuinely flowing — restart the elapsed timer from here so
+        the stream-open latency is not counted as recorded time."""
+        self.root.after(0, lambda: setattr(self, "_t0", time.time()))
+
+    def show_notice(self, text, seconds=1.6):
+        def run():
+            self._message = text
+            self.refresh()
+            self.root.after(int(seconds * 1000), self._clear_message)
+        self.root.after(0, run)
+
+    def show_loading(self, model_name):
+        self.root.after(0, lambda: (setattr(self, "_message",
+                                            f"Loading {model_name}…"),
+                                    self.refresh()))
+
+    def _clear_message(self):
+        self._message = None
+        self.refresh()
 
     def set_history_mode(self, on):
         self.history_mode = on

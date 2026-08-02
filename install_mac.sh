@@ -148,6 +148,11 @@ silently drops synthetic keystrokes. WhisperType logs the missing grants to
 $REPO/voice_daemon.log on startup.
 
 Usage: double-tap Right Command to start dictating, tap it once to stop.
-Change the hotkey in $PREFIX/config.json ("push_to_talk_key").
+Language, microphone, model and pause are in the menu-bar menu and take effect
+immediately. The hotkey lives in $PREFIX/config.json ("push_to_talk_key") and
+is the one setting that needs a restart.
+
+To update:     git pull && ./install_mac.sh     (safe to re-run any time)
+To uninstall:  ./uninstall_mac.sh
 
 EOF

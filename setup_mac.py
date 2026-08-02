@@ -11,7 +11,13 @@ Settings as an anonymous "python3" and silently break whenever the venv is
 rebuilt. py2app's launcher is a real Mach-O that loads libpython in-process, so
 the grants attach to WhisperType itself.
 """
+import sys
+from pathlib import Path
+
 from setuptools import setup
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from whispertype import __version__  # noqa: E402  single source of truth
 
 APP = ["main.py"]
 
@@ -21,8 +27,8 @@ OPTIONS = {
         "CFBundleName": "WhisperType",
         "CFBundleDisplayName": "WhisperType",
         "CFBundleIdentifier": "com.whispertype.app",
-        "CFBundleShortVersionString": "2.0.0",
-        "CFBundleVersion": "2.0.0",
+        "CFBundleShortVersionString": __version__,
+        "CFBundleVersion": __version__,
         "LSMinimumSystemVersion": "13.0",
         # Menu-bar only: no Dock icon, no app menu, never becomes frontmost.
         "LSUIElement": True,
