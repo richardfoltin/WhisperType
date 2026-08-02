@@ -427,6 +427,9 @@ class App:
 
             if not text:
                 return
+            # Run it across the overlay before it is typed, so there is a
+            # moment where you can see what is about to land in your document.
+            self.ui.set_ticker(text)
             entry["text"] = text
             self.jobs.add_history(entry)
 
@@ -445,7 +448,9 @@ class App:
         finally:
             self.jobs.finish(job)
             self.ui.call_soon(self.ui.refresh)
-            self.ui.call_later(100, self.ui.check_hide)
+            # Long enough for the transcript to finish running across the
+            # overlay (~700ms) before it disappears.
+            self.ui.call_later(900, self.ui.check_hide)
             if not self.jobs.busy() and not self.recording:
                 self.ui.set_tray_state("error" if self.last_error else "idle")
 

@@ -445,6 +445,9 @@ class TkUI:
             self.root.after(int(seconds * 1000), self._clear_message)
         self.root.after(0, run)
 
+    def set_ticker(self, text):
+        """No-op on Windows: the tkinter overlay has no ticker strip."""
+
     def show_loading(self, model_name):
         self.root.after(0, lambda: (setattr(self, "_message",
                                             f"Loading {model_name}…"),
