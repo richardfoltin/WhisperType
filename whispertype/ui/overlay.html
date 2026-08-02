@@ -1,217 +1,541 @@
 <style>
+/* ═══════════════════════════════════════════════════════════════════════════
+   WhisperType overlay.
+
+   The page paints NO background: an NSVisualEffectView sits behind this web
+   view and provides the material. Window alpha is 1.0, so text is opaque —
+   the previous build faded the whole window to 0.93, which ghosted the
+   desktop through the letterforms.
+
+   Every colour is a macOS system keyword, so the panel follows the user's
+   appearance, accent colour and contrast settings instead of a hand-rolled
+   Tailwind palette.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* LOAD-BEARING: without this WebKit resolves every -apple-system-* colour
+     against the LIGHT scheme even while prefers-color-scheme: dark matches. */
+  color-scheme: light dark;
+
+  --gutter:    16px;
+  --gap-group: 12px;
+  --gap-item:   8px;
+  --gap-pair:   4px;
+
+  /* Concentric with the 16pt layer.cornerRadius set in appkit_ui.py. */
+  --r-panel:   16px;
+  --r-plate:   10px;
+  --r-control:  6px;
+
+  /* system-ui is the only reliable way to get SF here: "SF Pro Text",
+     "SF Pro Display" and "SF Mono" are NOT resolvable by name in WKWebView —
+     they silently fall back to the default face. ui-monospace does work. */
+  --font: system-ui, sans-serif;
+
+  --label:    -apple-system-label;
+  --label-2:  -apple-system-secondary-label;
+  --label-3:  -apple-system-tertiary-label;
+  --hairline: -apple-system-separator;
+  --accent:   AccentColor;
+  --rec:      -apple-system-red;
+  --warn:     -apple-system-orange;
+
+  /* Plates mix from the label colour so they follow the appearance.
+     --tint-base flips to Canvas under Reduce Transparency, which turns every
+     plate opaque in one place. */
+  --tint-base:   transparent;
+  --plate:       color-mix(in srgb, CanvasText  8%, var(--tint-base));
+  --plate-hover: color-mix(in srgb, CanvasText 13%, var(--tint-base));
+  --plate-down:  color-mix(in srgb, CanvasText 20%, var(--tint-base));
+
+  /* Glyphs as masks, so currentColor drives them. AppKit replaces these with
+     real SF Symbols at `ready`; these are the self-contained fallbacks. */
+  --sym-xmark:   url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.6 2.6 9.4 9.4M9.4 2.6 2.6 9.4' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round'/></svg>");
+  --sym-trash:   url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'><path fill='black' d='M5.5 1h3a1 1 0 0 1 1 1v.6h2.4a.6.6 0 1 1 0 1.2h-.4l-.5 7.5A1.8 1.8 0 0 1 9.2 13H4.8a1.8 1.8 0 0 1-1.8-1.7L2.5 3.8h-.4a.6.6 0 1 1 0-1.2h2.4V2a1 1 0 0 1 1-1Zm3 1.6V2.2h-3v.4h3ZM5.6 5.2a.5.5 0 0 0-.5.5l.2 5a.5.5 0 0 0 1 0l-.2-5a.5.5 0 0 0-.5-.5Zm2.8 0a.5.5 0 0 0-.5.5l-.2 5a.5.5 0 0 0 1 0l.2-5a.5.5 0 0 0-.5-.5Z'/></svg>");
+  --sym-copy:    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'><path fill='none' stroke='black' stroke-width='1.2' d='M4.6 4.6V2.2a1 1 0 0 1 1-1h5.2a1 1 0 0 1 1 1v5.2a1 1 0 0 1-1 1H9.4'/><rect x='1.8' y='4.6' width='7.6' height='7.6' rx='1' fill='none' stroke='black' stroke-width='1.2'/></svg>");
+  --sym-check:   url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'><path d='M2.4 7.4 5.6 10.6 11.6 3.8' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  --sym-chevron: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><path d='M2 3.6 5 6.6 8 3.6' fill='none' stroke='black' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  --sym-clock:   url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 26 26'><circle cx='13' cy='13' r='11' fill='none' stroke='black' stroke-width='1.6'/><path d='M13 6.4V13l4.4 2.6' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  --sym-warn:    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'><path fill='black' fill-rule='evenodd' d='M7.87 1.9a1 1 0 0 0-1.74 0L.3 12.1a1 1 0 0 0 .87 1.5h11.66a1 1 0 0 0 .87-1.5ZM7 4.4a.65.65 0 0 1 .65.7l-.2 3.4a.45.45 0 0 1-.9 0l-.2-3.4A.65.65 0 0 1 7 4.4Zm0 5.7a.78.78 0 1 1 0 1.56.78.78 0 0 1 0-1.56Z'/></svg>");
+  --sym-info:    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'><path fill='black' fill-rule='evenodd' d='M7 0a7 7 0 1 1 0 14A7 7 0 0 1 7 0Zm0 1.2a5.8 5.8 0 1 0 0 11.6A5.8 5.8 0 0 0 7 1.2Zm0 4.5a.6.6 0 0 1 .6.6v3.5a.6.6 0 0 1-1.2 0V6.3a.6.6 0 0 1 .6-.6Zm0-2.4a.78.78 0 1 1 0 1.56.78.78 0 0 1 0-1.56Z'/></svg>");
+  --sym-arrow:   url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 6h7.2M6.4 3 9.6 6l-3.2 3' fill='none' stroke='black' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+
+/* `only` forces resolution independently of the system setting — kept in sync
+   with panel.setAppearance_() on the AppKit side. */
+:root[data-theme="light"] { color-scheme: only light; }
+:root[data-theme="dark"]  { color-scheme: only dark;  }
+
+/* prefers-reduced-transparency parses but never evaluates in this WKWebView,
+   so the flag arrives from NSWorkspace instead. */
+:root[data-reduce-transparency="1"] { --tint-base: Canvas; }
+:root[data-reduce-transparency="1"] html,
+:root[data-reduce-transparency="1"] body { background: Canvas; }
+
+:root[data-increase-contrast="1"] {
+  --label-2:  -apple-system-label;
+  --label-3:  -apple-system-secondary-label;
+  --hairline: -apple-system-container-border;
+}
+@media (prefers-contrast: more) {
   :root {
-    --bg:      #0f172a;
-    --rec:     #f87171;
-    --trans:   #fbbf24;
-    --text:    #f1f5f9;
-    --dim:     #64748b;
-    --bar-bg:  #1e293b;
-    --bar-lo:  #6ee7b7;
-    --bar-mid: #fbbf24;
-    --bar-hi:  #f87171;
-    --gpu-fill:#1a3a2a;
-    --sep:     #334155;
-    --danger:  #ef4444;
-    --sans: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
-    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --label-2:  -apple-system-label;
+    --label-3:  -apple-system-secondary-label;
+    --hairline: -apple-system-container-border;
   }
+}
 
-  /* Light appearance. `data-theme` is set from the config when it is not
-     "auto", and wins over the system preference in both directions. */
-  :root[data-theme="light"],
-  :root[data-theme="auto"]:where(.light-preferred) {
-    --bg:      #f8fafc;
-    --text:    #0f172a;
-    --dim:     #64748b;
-    --bar-bg:  #e2e8f0;
-    --bar-lo:  #059669;
-    --bar-mid: #d97706;
-    --bar-hi:  #dc2626;
-    --gpu-fill:#d1fae5;
-    --sep:     #cbd5e1;
-    --rec:     #dc2626;
-    --trans:   #d97706;
-    --danger:  #dc2626;
-  }
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      --bg:      #f8fafc;
-      --text:    #0f172a;
-      --dim:     #64748b;
-      --bar-bg:  #e2e8f0;
-      --bar-lo:  #059669;
-      --bar-mid: #d97706;
-      --bar-hi:  #dc2626;
-      --gpu-fill:#d1fae5;
-      --sep:     #cbd5e1;
-      --rec:     #dc2626;
-      --trans:   #d97706;
-      --danger:  #dc2626;
-    }
-  }
+html, body {
+  background: transparent;          /* the material must show through */
+  color: var(--label);
+  font: 13px/1.4 var(--font);
+  -webkit-font-smoothing: antialiased;
+  font-synthesis: none;
+  user-select: none; -webkit-user-select: none;
+  cursor: default;                  /* macOS never shows a hand cursor here */
+  overflow: hidden;
+}
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+#root { width: 380px; position: relative; }
 
-  html, body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    font-size: 11px;
-    user-select: none;
-    -webkit-user-select: none;
-    cursor: default;
-    overflow: hidden;
-  }
+/* The faint inner rim every real macOS panel has. Out of flow, so the height
+   report is unaffected. */
+#root::after {
+  content: ""; position: fixed; inset: 0; pointer-events: none;
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, CanvasText 13%, transparent);
+}
 
-  #root { width: 380px; }
+.hidden { display: none !important; }
+.num { font-variant-numeric: tabular-nums; }
+[role="button"] { outline: none; -webkit-tap-highlight-color: transparent; }
 
-  /* ── Title bar ── */
-  #titlebar {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 6px 10px 0 10px;
-    cursor: grab;
-  }
-  #titlebar.dragging { cursor: grabbing; }
-  #title { color: var(--dim); font-size: 11px; }
-  #close {
-    color: var(--dim); font-size: 15px; line-height: 1;
-    cursor: pointer; padding: 0 2px;
-  }
-  #close:hover { color: var(--text); }
+.sym {
+  display: inline-block; width: 13px; height: 13px; flex: none;
+  background: currentColor;
+  -webkit-mask: var(--sym, none) center / contain no-repeat;
+          mask: var(--sym, none) center / contain no-repeat;
+}
+.sym-xmark { --sym: var(--sym-xmark); }
 
-  .sep { height: 1px; background: var(--sep); margin: 2px 14px 6px 14px; }
+#probe { position: absolute; width: 0; height: 0; overflow: hidden; }
+#probe i[data-c="accent"] { color: var(--accent);   }
+#probe i[data-c="dim"]    { color: var(--label-3);  }
+#probe i[data-c="rec"]    { color: var(--rec);      }
+#probe i[data-c="line"]   { color: var(--hairline); }
 
-  /* ── GPU section ── */
-  #gpu { padding: 4px 14px; }
-  #gpu-hdr { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 2px; }
-  #gpu-label { color: var(--dim); font-size: 11px; font-weight: 600; }
-  #gpu-pct { color: var(--bar-lo); font-family: var(--mono); font-size: 12px; font-weight: 600; }
-  #gpu-canvas { display: block; width: 352px; height: 40px; background: var(--bar-bg); }
+/* ── Icon buttons ────────────────────────────────────────────────────────── */
+.icon-btn {
+  appearance: none; -webkit-appearance: none;
+  border: 0; padding: 0; margin: 0; background: transparent;
+  width: 22px; height: 22px; flex: none;
+  display: grid; place-items: center;
+  border-radius: var(--r-control);
+  color: var(--label-2);
+  cursor: default;
+  transition: opacity .12s ease, background-color .12s ease, color .12s ease;
+}
+.icon-btn:focus, .icon-btn:focus-visible { outline: none; }
+.icon-btn:hover  { background: var(--plate-hover); color: var(--label); }
+.icon-btn:active { background: var(--plate-down); }
+.icon-btn.destructive:hover { color: var(--rec); }
 
-  /* ── Recording section ── */
-  #rec { padding: 0 14px; }
-  #rec-hdr { display: flex; align-items: center; padding-bottom: 4px; }
-  #dot { color: var(--rec); font-size: 14px; line-height: 1; transition: opacity .12s; }
-  #state { font-size: 14px; font-weight: 700; margin-left: 4px; }
-  #timer { margin-left: auto; color: var(--dim); font-family: var(--mono); font-size: 14px; }
-  #info { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; }
-  #level-canvas { display: block; width: 352px; height: 24px; margin: 4px 0 2px 0; }
-  #hint { color: var(--dim); font-size: 11px; padding: 2px 0 6px 0; }
+/* ── Title bar ───────────────────────────────────────────────────────────── */
+#titlebar {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 28px; padding: 0 3px 0 var(--gutter);
+  border-bottom: 1px solid var(--hairline);
+}
+#title { font: 600 11px/1 var(--font); color: var(--label-2); }
 
-  /* The only place a failure is ever explained. */
-  #message {
-    color: var(--text); font-size: 12px; line-height: 1.35;
-    padding: 4px 8px; margin: 4px 0 2px 0;
-    border-left: 3px solid var(--danger); background: var(--bar-bg);
-    border-radius: 0 4px 4px 0;
-    white-space: pre-wrap; word-break: break-word;
-  }
-  #message.notice { border-left-color: var(--dim); color: var(--dim); }
-  #message.loading { border-left-color: var(--trans); color: var(--dim); }
+/* Notification-banner behaviour: nothing until the pointer arrives. Pinned in
+   error mode, where dismissing is the whole point. */
+#close { opacity: 0; }
+#root:hover #close,
+#root[data-mode="error"] #close { opacity: 1; }
 
-  /* ── Tables (queue + history) ── */
-  .table { padding: 0 14px 6px 14px; }
-  .thead, .row {
-    display: grid;
-    grid-template-columns: 66px 42px 62px 1fr auto;
-    align-items: center;
-    font-family: var(--mono);
-    font-size: 11px;
-    height: 22px;
-  }
-  .thead { color: var(--dim); }
-  .row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .row.waiting { color: var(--dim); }
-  .row.transcribing { color: var(--trans); }
-  .row.hist { color: var(--dim); }
+/* ── Status header ───────────────────────────────────────────────────────── */
+#status { padding: var(--gap-group) var(--gutter); }
+#status-row { display: flex; align-items: center; gap: var(--gap-item); }
 
-  .btns { display: flex; align-items: center; gap: 6px; padding-left: 6px; }
-  .btn { cursor: pointer; line-height: 1; }
-  .btn.copy { color: var(--bar-lo); font-size: 13px; }
-  .btn.del { color: var(--danger); font-size: 14px; font-weight: 700; }
-  .btn:hover { filter: brightness(1.35); }
+#dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--label-3); }
+#root[data-mode="recording"]    #dot { background: var(--rec);    }
+#root[data-mode="transcribing"] #dot { background: var(--accent); }
+#root[data-mode="loading"]      #dot { background: var(--warn);   }
+#root[data-mode="error"]        #dot { background: var(--rec);    }
 
-  #queue-more { color: var(--dim); font-family: var(--mono); font-size: 11px; height: 18px; }
+/* A slow halo, not a 500ms blink — macOS recording indicators are steady and
+   the waveform carries the liveness. */
+#root[data-mode="recording"] #dot {
+  animation: wt-pulse 2s ease-in-out infinite;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--rec) 22%, transparent);
+}
+@keyframes wt-pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
 
-  /* A history row that shows only time/app/window is useless for choosing
-     which transcript to copy — three dictations into the same app look
-     identical. The text goes inline, clamped, and stays selectable. */
-  .hist-item { padding-bottom: 4px; }
-  .hist-item + .hist-item { border-top: 1px solid var(--sep); padding-top: 3px; }
-  .hist-text {
-    color: var(--text); font-size: 11px; line-height: 1.4;
-    padding: 0 0 2px 2px;
-    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
-    overflow: hidden;
-    user-select: text; -webkit-user-select: text; cursor: text;
-  }
-  .hist-item.open .hist-text { -webkit-line-clamp: unset; }
-  .hist-text:empty { display: none; }
+#state { font: 600 15px/1.2 var(--font); color: var(--label); letter-spacing: -0.01em; }
+#root[data-mode="error"] #state { color: var(--rec); }
 
-  #hist-scroll { max-height: 240px; overflow-y: auto; overflow-x: hidden; }
-  #hist-scroll::-webkit-scrollbar { width: 6px; }
-  #hist-scroll::-webkit-scrollbar-thumb { background: var(--sep); border-radius: 3px; }
-  #hist-empty { color: var(--dim); font-size: 11px; height: 22px; line-height: 22px; }
+#timer {
+  margin-left: auto; font: 15px/1.2 var(--font);
+  font-variant-numeric: tabular-nums; color: var(--label-2);
+}
+#timer:empty { display: none; }
 
-  /* ── Tooltip ── */
-  #tooltip {
-    position: fixed; z-index: 99; display: none;
-    max-width: 340px; background: var(--bar-bg); color: var(--text);
-    font-size: 12px; line-height: 1.35; padding: 4px 8px;
-    border: 1px solid var(--sep); border-radius: 4px;
-    white-space: pre-wrap; word-break: break-word;
-  }
+#meta {
+  display: flex; align-items: baseline; gap: var(--gap-item);
+  margin-top: var(--gap-pair); min-height: 15px;   /* no reflow when empty */
+  font-size: 11px; color: var(--label-2);
+}
+#model { flex: none; }
+#target {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: baseline; gap: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#target .sym { --sym: var(--sym-arrow); width: 11px; height: 11px; color: var(--label-3); }
+#target:empty { display: none; }
+#gpu-chip { flex: none; margin-left: auto; color: var(--label-3); }
 
-  .hidden { display: none !important; }
+/* ── Level meter — only while recording ──────────────────────────────────── */
+#level-wrap { display: none; margin-top: var(--gap-group); }
+#root[data-mode="recording"] #level-wrap { display: block; }
+#level { display: block; width: 348px; height: 28px; }
+
+/* The run-up to auto-stop, replacing the red threshold tick — red means
+   "error" everywhere else in this UI. */
+#silence {
+  height: 3px; margin-top: 6px; border-radius: 999px;
+  background: var(--plate); overflow: hidden;
+  opacity: 0; transition: opacity .15s ease;
+}
+#silence.active { opacity: 1; }
+#silence > i {
+  display: block; height: 100%; width: 0%;
+  background: var(--accent); border-radius: inherit;
+  transition: width .1s linear;
+}
+
+/* Debug sparkline — off unless the config turns it on. */
+#gpu-graph { display: none; }
+:root[data-gpu-graph="1"] #gpu-graph {
+  display: block; width: 348px; height: 24px; margin-top: var(--gap-group);
+}
+
+/* ── Message ─────────────────────────────────────────────────────────────── */
+#message {
+  display: flex; align-items: flex-start; gap: var(--gap-item);
+  margin: 0 var(--gutter) var(--gap-group);
+  padding: 8px 10px; border-radius: var(--r-plate);
+  font-size: 13px; line-height: 1.35; color: var(--label);
+  background: color-mix(in srgb, var(--rec) 14%, var(--tint-base));
+  white-space: pre-wrap; word-break: break-word;
+}
+#message .sym { margin-top: 1px; color: var(--rec); --sym: var(--sym-warn); }
+#message.notice, #message.loading { background: var(--plate); color: var(--label-2); }
+#message.notice  .sym { color: var(--label-2); --sym: var(--sym-info); }
+#message.loading .sym { color: var(--warn);    --sym: var(--sym-info); }
+
+/* ── Queue ───────────────────────────────────────────────────────────────── */
+#queue { border-top: 1px solid var(--hairline); padding-bottom: var(--gap-item); }
+.group-hdr { font: 600 11px/1 var(--font); color: var(--label-2); padding: 10px var(--gutter) 2px; }
+#queue-rows { list-style: none; }
+
+.q-row {
+  display: flex; align-items: center; gap: var(--gap-item);
+  min-height: 28px; margin: 0 6px; padding: 0 2px 0 10px;
+  border-radius: var(--r-control);
+}
+.q-row:hover { background: var(--plate); }
+
+.q-glyph {
+  width: 12px; height: 12px; flex: none; border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--label-3);
+}
+.q-row[data-status="transcribing"] .q-glyph {
+  box-shadow: none;
+  background: conic-gradient(from 0deg,
+              color-mix(in srgb, var(--accent) 10%, transparent) 0deg,
+              var(--accent) 300deg,
+              color-mix(in srgb, var(--accent) 10%, transparent) 340deg);
+  -webkit-mask: radial-gradient(circle, transparent 3.2px, #000 3.7px);
+          mask: radial-gradient(circle, transparent 3.2px, #000 3.7px);
+  animation: wt-spin .9s steps(8, end) infinite;
+}
+@keyframes wt-spin { to { transform: rotate(360deg); } }
+
+.q-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.q-app   { flex: none; font-size: 11px; color: var(--label-2); }
+.q-title {
+  flex: 0 1 auto; min-width: 0; font-size: 13px; color: var(--label);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.q-dur { flex: none; font-size: 11px; color: var(--label-2); }
+.q-row .icon-btn { opacity: 0; }
+.q-row:hover .icon-btn { opacity: 1; }
+#queue-more { font-size: 11px; color: var(--label-2); padding: 4px var(--gutter) 0; }
+
+/* ── Hint ────────────────────────────────────────────────────────────────── */
+#hint {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+  padding: 10px var(--gutter) 12px;
+  border-top: 1px solid var(--hairline);
+  font-size: 11px; color: var(--label-2);
+}
+#hint:empty { display: none; }
+.kb { display: inline-flex; align-items: center; gap: 5px; }
+.kb kbd {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 17px; height: 16px; padding: 0 4px;
+  border-radius: 4px; background: var(--plate);
+  font: 600 11px/1 var(--font); color: var(--label);
+}
+
+/* History mode hides the recording chrome entirely — browsing transcripts
+   used to happen underneath a blinking dot and an empty audio meter. */
+#root[data-mode="history"] #status { display: none; }
+#root[data-mode="history"] #queue  { display: none !important; }
+
+/* ══ History ═══════════════════════════════════════════════════════════════
+   An NSTableView-shaped list: leading app icon, one metadata line, and the
+   transcript as the largest, highest-contrast thing in the row — it is the
+   only thing anyone is scanning for.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+#history { padding-bottom: 4px; }
+
+#h-head { display: flex; align-items: baseline; gap: 6px; padding: 10px 10px 8px var(--gutter); }
+#h-title { font: 600 15px/1.2 var(--font); letter-spacing: -0.01em; color: var(--label); }
+#h-count { font: 11px/1.2 var(--font); font-variant-numeric: tabular-nums; color: var(--label-3); }
+#h-clear {
+  margin-left: auto; font: 11px/1 var(--font); color: var(--accent);
+  padding: 4px 6px; border-radius: 5px;
+}
+#h-clear:hover  { background: var(--plate); }
+#h-clear:active { background: var(--plate-hover); }
+#h-clear.arm {                                   /* second click confirms */
+  color: var(--rec);
+  background: color-mix(in srgb, var(--rec) 15%, var(--tint-base));
+}
+
+#h-scroll { max-height: 340px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+/* No ::-webkit-scrollbar rules — the system overlay scrollbar is correct. */
+
+/* Sticky day header. backdrop-filter blurs PAGE content behind PAGE content,
+   which is legitimate; blurring the desktop is the material's job. */
+.h-group {
+  position: sticky; top: 0; z-index: 2;
+  padding: 5px var(--gutter) 3px;
+  font: 600 11px/1.35 var(--font); color: var(--label-2);
+  background: color-mix(in srgb, Canvas 55%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+          backdrop-filter: blur(20px) saturate(180%);
+}
+
+.h-row {
+  position: relative;
+  display: grid; grid-template-columns: 16px 1fr;
+  column-gap: 10px; align-items: start;
+  margin: 0 8px; padding: 7px 8px 9px;
+  border-radius: var(--r-control);
+}
+/* Separator inset to the text column, as AppKit insets its own. */
+.h-row + .h-row::before {
+  content: ""; position: absolute;
+  left: 34px; right: 8px; top: -0.5px; height: 1px;
+  background: var(--hairline); transition: opacity .1s ease;
+}
+.h-row:hover { background: var(--plate); }
+/* A translucent accent tint rather than the semantically correct
+   -apple-system-unemphasized-selected-content-background, which is opaque and
+   would punch a rectangle through the material. */
+.h-row.open { background: color-mix(in srgb, var(--accent) 18%, var(--tint-base)); }
+:root[data-reduce-transparency="1"] .h-row.open {
+  background: -apple-system-unemphasized-selected-content-background;
+}
+.h-row:hover::before, .h-row.open::before,
+.h-row:hover + .h-row::before, .h-row.open + .h-row::before { opacity: 0; }
+
+.h-icon {
+  grid-row: 1; width: 16px; height: 16px; margin-top: 2px; border-radius: 4px;
+  background-size: contain; background-repeat: no-repeat; background-position: center;
+}
+.h-icon.mono {
+  display: flex; align-items: center; justify-content: center;
+  background-color: color-mix(in srgb, CanvasText 12%, var(--tint-base));
+}
+.h-icon > span { display: none; }
+.h-icon.mono > span { display: block; font: 600 9px/1 var(--font); color: var(--label-2); }
+
+.h-body { grid-column: 2; min-width: 0; }
+
+.h-meta { display: flex; align-items: center; gap: 5px; height: 20px; }
+.h-app {
+  flex: 0 0 auto; max-width: 112px; font: 600 11px/1 var(--font); color: var(--label);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.h-win {
+  flex: 1 1 auto; min-width: 0; font: 11px/1 var(--font); color: var(--label-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.h-sep { flex: 0 0 auto; font-size: 11px; color: var(--label-3); }
+
+/* Fixed-width trailing slot: the stamp and the actions cross-fade in place, so
+   revealing the buttons can never change the row height and the panel never
+   resizes under the pointer. */
+.h-trail { position: relative; flex: 0 0 auto; width: 80px; height: 20px; margin-left: 4px; }
+.h-stamp, .h-actions {
+  position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+  display: flex; align-items: center; transition: opacity .1s ease;
+}
+.h-stamp {
+  gap: 4px; white-space: nowrap; font: 11px/1 var(--font);
+  font-variant-numeric: tabular-nums;   /* aligned digits in the SYSTEM font —
+                                           the only reason the old table was
+                                           monospace at all */
+  color: var(--label-2);
+}
+.h-actions { gap: 1px; opacity: 0; pointer-events: none; }
+.h-row:hover .h-stamp   { opacity: 0; }
+.h-row:hover .h-actions { opacity: 1; pointer-events: auto; }
+
+.h-btn {
+  width: 24px; height: 24px; border-radius: 5px;
+  display: grid; place-items: center; color: var(--label-2);
+}
+.h-btn::after {
+  content: ""; width: 14px; height: 14px; background: currentColor;
+  -webkit-mask: var(--sym) center/contain no-repeat;
+          mask: var(--sym) center/contain no-repeat;
+}
+.h-btn.copy { --sym: var(--sym-copy);  }
+.h-btn.del  { --sym: var(--sym-trash); }
+.h-btn.done { --sym: var(--sym-check); color: -apple-system-green; }
+.h-btn:hover { background: var(--plate-hover); color: var(--label); }
+.h-btn.del:hover {
+  color: var(--rec);
+  background: color-mix(in srgb, var(--rec) 18%, var(--tint-base));
+}
+.h-btn:active { background: var(--plate-down); }
+
+/* The transcript: the primary element, at macOS body size, selectable. */
+.h-text {
+  margin-top: 1px; font: 13px/1.45 var(--font); color: var(--label);
+  word-break: break-word; text-wrap: pretty;
+  user-select: text; -webkit-user-select: text;
+  display: -webkit-box; -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3; overflow: hidden;
+}
+.h-row.open .h-text { -webkit-line-clamp: 9999; }
+.h-text:empty::before {
+  content: "(no text)"; color: var(--label-3); font-style: italic;
+}
+
+.h-foot { display: none; align-items: center; gap: 6px; margin-top: 4px; }
+.h-row.clipped .h-foot, .h-row.open .h-foot { display: flex; }
+.h-disc { display: inline-flex; align-items: center; gap: 3px; font: 11px/1 var(--font); color: var(--accent); }
+.h-disc::after {
+  content: ""; width: 9px; height: 9px; background: currentColor;
+  -webkit-mask: var(--sym-chevron) center/contain no-repeat;
+          mask: var(--sym-chevron) center/contain no-repeat;
+  transition: transform .15s ease;
+}
+.h-row.open .h-disc::after { transform: rotate(180deg); }
+.h-words { font: 11px/1 var(--font); font-variant-numeric: tabular-nums; color: var(--label-3); }
+
+#h-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  padding: 34px var(--gutter) 38px; text-align: center;
+}
+#h-empty.hidden { display: none; }
+#h-empty .ei {
+  width: 26px; height: 26px; margin-bottom: 2px; background: var(--label-3);
+  -webkit-mask: var(--sym-clock) center/contain no-repeat;
+          mask: var(--sym-clock) center/contain no-repeat;
+}
+#h-empty .et { font: 600 13px/1.3 var(--font); color: var(--label-2); }
+#h-empty .es { font: 11px/1.35 var(--font); color: var(--label-3); }
+
+/* ── Tooltip (window titles are ellipsised in an 80px-constrained row) ────── */
+#tooltip {
+  position: fixed; z-index: 99; display: none; max-width: 340px;
+  background: color-mix(in srgb, Canvas 92%, CanvasText);
+  color: var(--label); font-size: 12px; line-height: 1.35;
+  padding: 4px 8px; border: 0.5px solid var(--hairline); border-radius: 6px;
+  white-space: pre-wrap; word-break: break-word;
+  box-shadow: 0 4px 14px rgba(0,0,0,.28);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #dot, .q-glyph { animation: none !important; }
+  #close, .icon-btn, #silence, #silence > i,
+  .h-stamp, .h-actions, .h-disc::after, .h-row + .h-row::before { transition: none !important; }
+}
+:root[data-reduce-motion="1"] #dot,
+:root[data-reduce-motion="1"] .q-glyph { animation: none !important; }
+@media (prefers-contrast: more) {
+  .h-row + .h-row::before { background: -apple-system-container-border; }
+  .h-win, .h-stamp { color: var(--label); }
+  .h-words, #h-count { color: var(--label-2); }
+}
 </style>
 
-<div id="root">
-  <div id="titlebar">
+<div id="root" data-mode="idle">
+
+  <header id="titlebar">
     <span id="title">WhisperType</span>
-    <span id="close">&times;</span>
-  </div>
+    <button id="close" class="icon-btn no-drag" type="button" tabindex="-1" aria-label="Hide">
+      <i class="sym sym-xmark"></i>
+    </button>
+  </header>
 
-  <section id="gpu" class="hidden">
-    <div id="gpu-hdr">
-      <span id="gpu-label">GPU</span>
-      <span id="gpu-pct">--%</span>
-    </div>
-    <canvas id="gpu-canvas" width="704" height="80"></canvas>
-  </section>
-
-  <section id="rec">
-    <div class="sep" id="rec-sep"></div>
-    <div id="rec-hdr">
-      <span id="dot">&#9679;</span>
+  <section id="status">
+    <div id="status-row">
+      <span id="dot"></span>
       <span id="state">Ready</span>
-      <span id="timer"></span>
+      <span id="timer" class="num"></span>
     </div>
-    <div id="info">
+    <div id="meta">
       <span id="model"></span>
       <span id="target"></span>
+      <span id="gpu-chip" class="num hidden"></span>
     </div>
-    <canvas id="level-canvas" width="704" height="48"></canvas>
-    <div id="message" class="hidden"></div>
-    <div id="hint"></div>
+    <div id="level-wrap">
+      <canvas id="level"></canvas>
+      <div id="silence"><i></i></div>
+    </div>
+    <canvas id="gpu-graph"></canvas>
   </section>
 
-  <section id="queue" class="table hidden">
-    <div class="sep"></div>
-    <div class="thead">
-      <span>TIME</span><span>DUR</span><span>APP</span><span>WINDOW</span><span></span>
-    </div>
-    <div id="queue-rows"></div>
+  <div id="message" class="hidden"><i class="sym"></i><span id="message-text"></span></div>
+
+  <section id="queue" class="hidden">
+    <div class="group-hdr">Transcribing</div>
+    <ul id="queue-rows"></ul>
     <div id="queue-more" class="hidden"></div>
   </section>
 
-  <section id="history" class="table hidden">
-    <div class="sep"></div>
-    <div class="thead">
-      <span>TIME</span><span>DUR</span><span>APP</span><span>WINDOW</span><span></span>
+  <section id="history" class="hidden">
+    <div id="h-head">
+      <span id="h-title">History</span>
+      <span id="h-count"></span>
+      <span id="h-clear" role="button" class="hidden">Clear All</span>
     </div>
-    <div id="hist-scroll"><div id="hist-rows"></div></div>
+    <div id="h-scroll"><div id="h-list"></div></div>
+    <div id="h-empty" class="hidden">
+      <span class="ei" aria-hidden="true"></span>
+      <span class="et">No Transcriptions Yet</span>
+      <span class="es">Dictation that cannot be typed lands here.</span>
+    </div>
   </section>
+
+  <footer id="hint"></footer>
+
+  <!-- Canvases cannot read CSS system keywords; these resolve them for JS. -->
+  <div id="probe" aria-hidden="true">
+    <i data-c="accent"></i><i data-c="dim"></i><i data-c="rec"></i><i data-c="line"></i>
+  </div>
 </div>
 
 <div id="tooltip"></div>
@@ -225,282 +549,384 @@
     try { window.webkit.messageHandlers.wt.postMessage(msg); } catch (e) {}
   };
 
-  // Canvases cannot use CSS variables, so read the resolved values. Recomputed
-  // whenever the appearance changes so the graphs follow light/dark mode.
-  let C = {};
-  function readColors() {
-    const s = getComputedStyle(document.documentElement);
-    const v = (n, fallback) => (s.getPropertyValue(n).trim() || fallback);
-    C = {
-      bg: v("--bg", "#0f172a"), barBg: v("--bar-bg", "#1e293b"),
-      barLo: v("--bar-lo", "#6ee7b7"), barMid: v("--bar-mid", "#fbbf24"),
-      barHi: v("--bar-hi", "#f87171"), gpuFill: v("--gpu-fill", "#1a3a2a"),
-      danger: v("--danger", "#ef4444"), dim: v("--dim", "#64748b"),
-      text: v("--text", "#f1f5f9"), rec: v("--rec", "#f87171"),
-      trans: v("--trans", "#fbbf24"), grid: v("--sep", "#334155"),
-    };
-  }
-  readColors();
-  const mq = window.matchMedia("(prefers-color-scheme: light)");
-  mq.addEventListener("change", () => { readColors(); drawGpu(); drawLevel(); });
-
-  const DPR = 2;                 // canvases are declared at 2x
-  const GPU_WINDOW = 60;         // samples the graph is scaled against
   const MAX_QUEUE_VISIBLE = 5;
+  const GPU_WINDOW = 60;
 
   let state = {
-    mode: "idle", model: "", target: "", hint: "",
+    mode: "idle", model: "", target: "", hint: [], message: "",
     gpuAvailable: false, gpuLabel: "GPU", recStart: 0,
   };
   let gpuSeries = [];
-  let level = 0, levelMax = 4000, levelThreshold = 200;
+  let lastHistory = [];
+  let appIcons = {};
 
-  // ── Rendering helpers ──────────────────────────────────────────────────
+  // ── Colour probe ────────────────────────────────────────────────────────
+  // Custom properties holding system keywords return the literal string
+  // "AccentColor" from getPropertyValue, so the canvas needs resolved values.
+  let C = {};
+  function probeColors() {
+    for (const el of document.querySelectorAll("#probe i"))
+      C[el.dataset.c] = getComputedStyle(el).color;
+  }
+  probeColors();
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    probeColors(); drawLevel(); drawGpu();
+  });
 
-  function ctxOf(canvas) {
-    const c = canvas.getContext("2d");
-    c.setTransform(DPR, 0, 0, DPR, 0, 0);
-    return c;
+  function fit(cv) {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const r = cv.getBoundingClientRect();
+    if (cv.width !== Math.round(r.width * dpr)) {
+      cv.width = Math.round(r.width * dpr);
+      cv.height = Math.round(r.height * dpr);
+    }
+    const c = cv.getContext("2d");
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return [c, r.width, r.height];
+  }
+
+  // ── Level meter: a scrolling waveform ───────────────────────────────────
+  const BAR = 2, PITCH = 4;
+  let hist = [], levelMax = 4000, levelThreshold = 200, quietSince = 0, silenceHold = 3;
+
+  function drawLevel() {
+    const cv = $("level");
+    if (!cv.getClientRects().length) return;      // hidden: nothing to draw
+    const [c, W, H] = fit(cv);
+    c.clearRect(0, 0, W, H);                      // NOT fillRect — no hole in
+    const thr = levelThreshold / levelMax;        // the material
+    for (let i = 0; i < hist.length; i++) {
+      const v = hist[hist.length - 1 - i];        // newest at the right
+      const x = W - BAR - i * PITCH;
+      if (x < 0) break;
+      const h = Math.max(2, Math.round(v * (H - 2)));
+      c.fillStyle = v >= thr ? C.accent : C.dim;
+      c.globalAlpha = v >= thr ? 1 : 0.55;
+      c.beginPath();
+      c.roundRect(x, (H - h) / 2, BAR, h, 1);
+      c.fill();
+    }
+    c.globalAlpha = 1;
   }
 
   function drawGpu() {
-    const cv = $("gpu-canvas"), c = ctxOf(cv);
-    const W = cv.width / DPR, H = cv.height / DPR;
+    const cv = $("gpu-graph");
+    if (!cv.getClientRects().length) return;
+    const [c, W, H] = fit(cv);
     c.clearRect(0, 0, W, H);
-    c.fillStyle = C.barBg; c.fillRect(0, 0, W, H);
-
-    c.strokeStyle = C.grid; c.lineWidth = 1;
+    c.strokeStyle = C.line; c.lineWidth = 1;
     for (const p of [0.25, 0.5, 0.75]) {
       const y = Math.round(H * (1 - p)) + 0.5;
       c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke();
     }
-
     const n = gpuSeries.length;
     if (n < 2) return;
-
-    // Right-aligned: a partially filled window does not stretch to full width.
-    const graphW = W * (n / GPU_WINDOW);
-    const xOff = W - graphW;
-    const step = graphW / (n - 1);
+    const graphW = W * (n / GPU_WINDOW), xOff = W - graphW, step = graphW / (n - 1);
     const pts = gpuSeries.map((v, i) => [xOff + i * step, H * (1 - v)]);
-
-    c.fillStyle = C.gpuFill;
-    c.beginPath();
-    c.moveTo(xOff, H);
-    for (const [x, y] of pts) c.lineTo(x, y);
-    c.lineTo(pts[pts.length - 1][0], H);
-    c.closePath(); c.fill();
-
-    c.strokeStyle = C.barLo; c.lineWidth = 2;
+    c.strokeStyle = C.accent; c.lineWidth = 2;
     c.beginPath();
     pts.forEach(([x, y], i) => (i ? c.lineTo(x, y) : c.moveTo(x, y)));
     c.stroke();
   }
 
-  function drawLevel() {
-    const cv = $("level-canvas"), c = ctxOf(cv);
-    const W = cv.width / DPR, H = cv.height / DPR;
-    c.clearRect(0, 0, W, H);
-    c.fillStyle = C.barBg; c.fillRect(0, 0, W, H);
-
-    const r = Math.min(level / levelMax, 1);
-    const color = r < 0.4 ? C.barLo : (r < 0.75 ? C.barMid : C.barHi);
-    if (r > 0) { c.fillStyle = color; c.fillRect(0, 0, W * r, H); }
-
-    const sx = Math.round(W * Math.min(levelThreshold / levelMax, 1)) + 0.5;
-    c.strokeStyle = C.danger; c.lineWidth = 2;
-    c.beginPath(); c.moveTo(sx, 0); c.lineTo(sx, H); c.stroke();
-
-    c.strokeStyle = C.bg; c.lineWidth = 1;
-    for (const p of [0.25, 0.5, 0.75]) {
-      const x = Math.round(W * p) + 0.5;
-      c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke();
-    }
-  }
-
-  // ── Timer + blink (kept in JS so Python never drives per-frame work) ────
-
-  let blinkOn = true;
-  setInterval(() => {
-    if (state.mode !== "recording") return;
-    blinkOn = !blinkOn;
-    $("dot").style.opacity = blinkOn ? "1" : "0";
-  }, 500);
-
+  // ── Timer ───────────────────────────────────────────────────────────────
   setInterval(() => {
     if (state.mode !== "recording") return;
     const e = Math.floor((Date.now() - state.recStart) / 1000);
     $("timer").textContent = `${Math.floor(e / 60)}:${String(e % 60).padStart(2, "0")}`;
   }, 250);
 
-  // ── Public API called from Python ──────────────────────────────────────
+  // ── Helpers ─────────────────────────────────────────────────────────────
+  function span(text) { const s = document.createElement("span"); s.textContent = text; return s; }
+  function dot() { const s = span("·"); s.className = "h-sep"; return s; }
+
+  function iconBtn(sym, label, destructive, onClick) {
+    const b = document.createElement("button");
+    b.type = "button"; b.tabIndex = -1;
+    b.className = "icon-btn no-drag" + (destructive ? " destructive" : "");
+    b.setAttribute("aria-label", label);
+    const i = document.createElement("i"); i.className = "sym sym-" + sym;
+    b.append(i);
+    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
+    return b;
+  }
+
+  function hBtn(cls, label, onClick) {
+    const b = document.createElement("span");
+    b.className = "h-btn " + cls;
+    b.setAttribute("role", "button");
+    b.setAttribute("aria-label", label);
+    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(b); });
+    return b;
+  }
+
+  const durFmt = (s) => (!isFinite(s) ? "" : s < 60
+    ? `${s.toFixed(1)}s`
+    : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`);
+
+  function dayLabel(at) {
+    if (!at) return "Earlier";
+    const d = new Date(at * 1000), n = new Date();
+    const sod = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const diff = Math.round((sod(n) - sod(d)) / 86400000);
+    if (diff <= 0) return "Today";
+    if (diff === 1) return "Yesterday";
+    if (diff < 7) return d.toLocaleDateString(undefined, { weekday: "long" });
+    if (d.getFullYear() === n.getFullYear())
+      return d.toLocaleDateString(undefined, { month: "long", day: "numeric" });
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+  }
+  function clockOf(it) {
+    if (it.at) return new Date(it.at * 1000)
+      .toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    return String(it.ts || "").slice(0, 5);       // legacy "14:22:55" entries
+  }
+  function durOf(it) {
+    return durFmt(it.secs !== undefined ? it.secs : parseFloat(it.dur));
+  }
+  function wordsOf(t) {
+    const n = (t || "").trim().split(/\s+/).filter(Boolean).length;
+    return n === 1 ? "1 word" : `${n} words`;
+  }
+
+  // ── Tooltip ─────────────────────────────────────────────────────────────
+  function attachTooltip(el, text) {
+    const tip = $("tooltip");
+    el.addEventListener("mouseenter", () => {
+      if (el.scrollWidth <= el.clientWidth) return;   // not actually truncated
+      tip.textContent = text;
+      tip.style.display = "block";
+      const r = el.getBoundingClientRect(), t = tip.getBoundingClientRect();
+      let y = r.top - t.height - 4;
+      if (y < 2) y = r.bottom + 4;
+      tip.style.left = Math.max(4, Math.min(r.left, window.innerWidth - t.width - 4)) + "px";
+      tip.style.top = y + "px";
+    });
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  }
+
+  // ── Public API ──────────────────────────────────────────────────────────
+  const LABEL = {
+    recording: "Recording", transcribing: "Transcribing", history: "History",
+    error: "Failed", notice: "Ready", loading: "Loading", idle: "Ready",
+  };
 
   const api = {
     setState(s) {
       Object.assign(state, s);
-      if (s.theme) {
-        document.documentElement.dataset.theme = s.theme;
-        readColors();
-        drawGpu();
+      if (s.theme) document.documentElement.dataset.theme = s.theme;
+      if (s.silenceHold) silenceHold = s.silenceHold;
+      if (s.gpuGraph !== undefined)
+        document.documentElement.dataset.gpuGraph = s.gpuGraph ? "1" : "0";
+
+      const root = $("root");
+      root.dataset.mode = state.mode;
+      $("state").textContent = LABEL[state.mode] || "Ready";
+      $("title").textContent = state.mode === "history" ? "History" : "WhisperType";
+      $("model").textContent = state.model || "";
+
+      const tgt = $("target");
+      tgt.textContent = "";
+      if (state.target) {
+        const i = document.createElement("i"); i.className = "sym";
+        tgt.append(i, span(state.target));
       }
-      const dot = $("dot"), st = $("state");
-      $("gpu").classList.toggle("hidden", !state.gpuAvailable);
-      $("gpu-label").textContent = state.gpuLabel || "GPU";
-      $("model").textContent = state.model ? `Model: ${state.model}` : "";
-      $("target").textContent = state.target ? `→ ${state.target}` : "";
-      $("hint").textContent = state.hint || "";
 
       const msg = $("message");
-      msg.textContent = state.message || "";
       msg.className = state.message
-        ? (state.mode === "error" ? "" : state.mode)
-        : "hidden";
+        ? (state.mode === "error" ? "" : state.mode) : "hidden";
+      $("message-text").textContent = state.message || "";
 
-      const M = {
-        recording:    { color: C.rec,    label: "Recording" },
-        transcribing: { color: C.trans,  label: "Transcribing" },
-        history:      { color: C.barLo,  label: "History" },
-        error:        { color: C.danger, label: "Failed" },
-        notice:       { color: C.dim,    label: "Ready" },
-        loading:      { color: C.trans,  label: "Loading" },
-        idle:         { color: C.dim,    label: "Ready" },
-      }[state.mode] || { color: C.dim, label: "Ready" };
+      const hint = $("hint");
+      hint.textContent = "";
+      for (const h of (state.hint || [])) {
+        const w = document.createElement("span"); w.className = "kb";
+        const k = document.createElement("kbd"); k.textContent = h.key;
+        w.append(k, document.createTextNode(h.label));
+        hint.append(w);
+      }
 
-      dot.style.color = M.color;
-      dot.style.opacity = "1";
-      st.textContent = M.label;
-      st.style.color = state.mode === "recording" ? C.text : M.color;
-      if (state.mode !== "recording") $("timer").textContent = "";
+      if (state.mode !== "recording") {
+        $("timer").textContent = ""; hist = []; quietSince = 0;
+      }
       drawLevel();
       report();
     },
 
     setLevel(rms, threshold, max) {
-      level = rms;
       if (threshold !== undefined) levelThreshold = threshold;
       if (max !== undefined) levelMax = max;
+      hist.push(Math.min(rms / levelMax, 1));
+      const cap = Math.ceil(348 / PITCH);
+      if (hist.length > cap) hist.splice(0, hist.length - cap);
+
+      if (rms >= levelThreshold) quietSince = 0;
+      else if (!quietSince) quietSince = Date.now();
+      const held = quietSince ? (Date.now() - quietSince) / 1000 : 0;
+      const sil = $("silence");
+      sil.classList.toggle("active", state.mode === "recording" && held > 0.25);
+      sil.firstElementChild.style.width = Math.min(held / silenceHold, 1) * 100 + "%";
       drawLevel();
     },
 
     setGpu(series, pct) {
-      gpuSeries = series;
-      const el = $("gpu-pct");
-      if (pct === null || pct === undefined) {
-        el.textContent = "--%";
-      } else {
-        el.textContent = `${pct}%`;
-        el.style.color = pct < 50 ? C.barLo : (pct < 80 ? C.barMid : C.barHi);
-      }
-      drawGpu();
+      gpuSeries = series || [];
+      const chip = $("gpu-chip");
+      const show = pct != null && state.gpuAvailable && state.mode === "transcribing";
+      chip.classList.toggle("hidden", !show);
+      chip.textContent = show ? `${state.gpuLabel || "GPU"} ${pct}%` : "";
+      if (document.documentElement.dataset.gpuGraph === "1") drawGpu();
     },
 
     setQueue(items) {
       const box = $("queue-rows");
       box.textContent = "";
-      const shown = items.slice(0, MAX_QUEUE_VISIBLE);
-      for (const it of shown) {
-        const row = document.createElement("div");
-        row.className = "row " + (it.status === "transcribing" ? "transcribing" : "waiting");
-        row.append(
-          span(it.ts), span(it.dur), span(it.app), span(it.window)
-        );
-        const btns = document.createElement("span");
-        btns.className = "btns";
-        btns.append(btn("del", "×", () => post({ action: "cancelJob", id: it.id })));
-        row.append(btns);
-        box.append(row);
+      for (const it of items.slice(0, MAX_QUEUE_VISIBLE)) {
+        const li = document.createElement("li");
+        li.className = "q-row"; li.dataset.status = it.status;
+        const g = document.createElement("span"); g.className = "q-glyph";
+        const main = document.createElement("span"); main.className = "q-main";
+        const a = span(it.app || ""); a.className = "q-app";
+        const w = span(it.window || ""); w.className = "q-title";
+        main.append(a, w);
+        const d = span(durFmt(it.seconds)); d.className = "q-dur num";
+        li.append(g, main, d, iconBtn("xmark", "Cancel", true,
+          () => post({ action: "cancelJob", id: it.id })));
+        box.append(li);
       }
       const more = $("queue-more");
       more.classList.toggle("hidden", items.length <= MAX_QUEUE_VISIBLE);
-      more.textContent = `  +${items.length - MAX_QUEUE_VISIBLE} more…`;
+      more.textContent = `+${items.length - MAX_QUEUE_VISIBLE} more`;
       $("queue").classList.toggle("hidden", items.length === 0 || state.mode === "history");
       report();
     },
 
+    setAppIcons(map) { Object.assign(appIcons, map); api.setHistory(lastHistory); },
+
     setHistory(items) {
-      const box = $("hist-rows");
+      lastHistory = items || [];
+      const box = $("h-list");
       box.textContent = "";
-      if (!items.length) {
-        const e = document.createElement("div");
-        e.id = "hist-empty";
-        e.textContent = "  No transcriptions yet";
-        box.append(e);
-      }
-      // Newest first; index is into the original (oldest-first) list.
-      items.slice().reverse().forEach((it) => {
-        const item = document.createElement("div");
-        item.className = "hist-item";
+      $("h-empty").classList.toggle("hidden", lastHistory.length > 0);
+      $("h-count").textContent = lastHistory.length
+        ? (lastHistory.length === 1 ? "1 recording" : `${lastHistory.length} recordings`) : "";
+      $("h-clear").classList.toggle("hidden", lastHistory.length === 0);
+
+      let group = null;
+      // Newest first. `index` is computed in Python before this reverse.
+      lastHistory.slice().reverse().forEach((it) => {
+        const label = dayLabel(it.at);
+        if (label !== group) {
+          group = label;
+          const g = document.createElement("div");
+          g.className = "h-group"; g.textContent = label;
+          box.append(g);
+        }
 
         const row = document.createElement("div");
-        row.className = "row hist";
-        row.append(span(it.ts), span(it.dur), span(it.app), span(it.window));
-        const btns = document.createElement("span");
-        btns.className = "btns";
-        btns.append(btn("copy", "\u{1F4CB}", () => post({ action: "copy", text: it.text })));
-        btns.append(btn("del", "×", () => post({ action: "deleteHistory", index: it.index })));
-        row.append(btns);
+        row.className = "h-row";
+        row.dataset.id = it.index;
+
+        const icon = document.createElement("div");
+        const src = appIcons[it.bundle] || appIcons[it.app];
+        if (src) { icon.className = "h-icon"; icon.style.backgroundImage = `url(${src})`; }
+        else {
+          icon.className = "h-icon mono";
+          icon.append(span(((it.app || "?").trim()[0] || "?").toUpperCase()));
+        }
+
+        const body = document.createElement("div"); body.className = "h-body";
+        const meta = document.createElement("div"); meta.className = "h-meta";
+        const appEl = span(it.app || "Unknown"); appEl.className = "h-app";
+        const winEl = span(it.window || ""); winEl.className = "h-win";
+        meta.append(appEl, dot(), winEl);
+
+        const trail = document.createElement("span"); trail.className = "h-trail";
+        const stamp = document.createElement("span"); stamp.className = "h-stamp";
+        stamp.append(span(durOf(it)), dot(), span(clockOf(it)));
+
+        const acts = document.createElement("span"); acts.className = "h-actions";
+        acts.append(hBtn("copy", "Copy", (b) => {
+          post({ action: "copy", text: it.text || "" });
+          b.classList.add("done");                 // the pasteboard write is
+          clearTimeout(b._t);                      // otherwise silent
+          b._t = setTimeout(() => b.classList.remove("done"), 1100);
+        }));
+        acts.append(hBtn("del", "Delete",
+          () => post({ action: "deleteHistory", index: it.index })));
+        trail.append(stamp, acts);
+        meta.append(trail);
 
         const text = document.createElement("div");
-        text.className = "hist-text";
-        text.textContent = it.text || "";
-        // Clamped to three lines; click the meta row to expand a long one.
-        row.addEventListener("click", () => {
-          item.classList.toggle("open");
+        text.className = "h-text"; text.textContent = it.text || "";
+
+        const foot = document.createElement("div"); foot.className = "h-foot";
+        const disc = document.createElement("span");
+        disc.className = "h-disc"; disc.setAttribute("role", "button");
+        disc.textContent = "Show More";
+        const wc = span(wordsOf(it.text)); wc.className = "h-words";
+        foot.append(disc, wc);
+
+        body.append(meta, text, foot);
+        row.append(icon, body);
+
+        row.addEventListener("click", (e) => {
+          if (e.target.closest(".h-btn")) return;
+          if (String(window.getSelection())) return;
+          if (!row.classList.contains("clipped")) return;
+          const open = row.classList.toggle("open");
+          disc.textContent = open ? "Show Less" : "Show More";
           report();
         });
 
-        item.append(row, text);
-        box.append(item);
+        if (it.window) attachTooltip(winEl, it.window);
+        box.append(row);
       });
-      report();
+
+      // Clipping can only be measured after layout.
+      requestAnimationFrame(() => {
+        for (const row of box.querySelectorAll(".h-row")) {
+          const t = row.querySelector(".h-text");
+          if (t.scrollHeight > t.clientHeight + 1) row.classList.add("clipped");
+        }
+        report();
+      });
     },
 
     setMode(mode) {
+      document.documentElement.dataset.view = mode;
       $("history").classList.toggle("hidden", mode !== "history");
       if (mode === "history") $("queue").classList.add("hidden");
       report();
     },
   };
 
-  function span(text) {
-    const s = document.createElement("span");
-    s.textContent = text;
-    return s;
-  }
+  // ── Clear All: two-step, because a modal would need key window ──────────
+  let armUntil = 0;
+  $("h-clear").addEventListener("click", () => {
+    const el = $("h-clear");
+    if (Date.now() < armUntil) {
+      armUntil = 0; el.classList.remove("arm"); el.textContent = "Clear All";
+      post({ action: "clearHistory" });
+      return;
+    }
+    armUntil = Date.now() + 3000;
+    el.classList.add("arm"); el.textContent = "Clear All?";
+    setTimeout(() => {
+      if (Date.now() >= armUntil) {
+        armUntil = 0; el.classList.remove("arm"); el.textContent = "Clear All";
+      }
+    }, 3100);
+  });
 
-  function btn(cls, text, onClick) {
-    const b = document.createElement("span");
-    b.className = "btn " + cls;
-    b.textContent = text;
-    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
-    return b;
-  }
+  $("close").addEventListener("click", () => post({ action: "hide" }));
 
-  // ── Tooltip ────────────────────────────────────────────────────────────
-
-  function attachTooltip(el, text) {
-    const tip = $("tooltip");
-    el.addEventListener("mouseenter", () => {
-      tip.textContent = text;
-      tip.style.display = "block";
-      const r = el.getBoundingClientRect();
-      const t = tip.getBoundingClientRect();
-      let y = r.top - t.height - 4;
-      if (y < 2) y = r.bottom + 4;
-      let x = Math.min(r.left, window.innerWidth - t.width - 4);
-      tip.style.left = Math.max(4, x) + "px";
-      tip.style.top = y + "px";
-    });
-    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
-  }
-
-  // ── Window dragging (WKWebView swallows the panel's own drag handling) ──
-
+  // ── Dragging from anywhere that is not a control ────────────────────────
   let dragging = null;
-  $("titlebar").addEventListener("mousedown", (e) => {
-    if (e.target.id === "close") return;
+  $("root").addEventListener("mousedown", (e) => {
+    if (e.target.closest("button, .no-drag, .h-btn, [role='button'], #h-scroll")) return;
+    if (window.getSelection && String(window.getSelection())) return;
     dragging = { x: e.screenX, y: e.screenY };
-    $("titlebar").classList.add("dragging");
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
@@ -510,15 +936,9 @@
       post({ action: "drag", dx, dy });
     }
   });
-  window.addEventListener("mouseup", () => {
-    dragging = null;
-    $("titlebar").classList.remove("dragging");
-  });
+  window.addEventListener("mouseup", () => { dragging = null; });
 
-  $("close").addEventListener("click", () => post({ action: "hide" }));
-
-  // ── Height reporting: Python resizes the panel to fit ──────────────────
-
+  // ── Height reporting: Python resizes the panel to fit ───────────────────
   let lastH = 0;
   function report() {
     requestAnimationFrame(() => {
@@ -528,7 +948,6 @@
   }
 
   window.wt = api;
-  drawGpu();
   drawLevel();
   report();
   post({ action: "ready" });

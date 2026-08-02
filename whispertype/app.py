@@ -404,9 +404,15 @@ class App:
             log(f"Skipped cancelled job {job.job_id}")
             return
         entry = {
+            # `at` and `secs` are the raw values the UI formats and groups by;
+            # `ts`/`dur` stay for tk_ui and for history.json written by older
+            # builds. `app` is no longer truncated — the view ellipsises.
+            "at": int(job.created_at),
+            "secs": round(job.audio_duration, 2),
             "ts": time.strftime("%H:%M:%S", time.localtime(job.created_at)),
             "dur": f"{job.audio_duration:.1f}s",
-            "app": job.app_name[:8] if job.app_name else "?",
+            "app": job.app_name or "?",
+            "bundle": getattr(job.target, "bundle_id", "") or "",
             "window": job.window_name,
             "text": "",
         }
@@ -845,9 +851,9 @@ class App:
         # Scoped to the states where the user is actually interacting with the
         # overlay. Gating on "overlay visible" meant every space bar pressed in
         # another app during a transcription toggled history mode.
-        if key == K.space and (self.recording or self.ui.history_mode):
-            self.ui.call_soon(self.toggle_history)
-            return
+        # History is a menu-bar item now. Binding it to Space meant a key you
+        # press constantly was being watched globally for the whole time the
+        # overlay happened to be up.
 
         if key == K.esc and self.ui.visible:
             if self.recording:

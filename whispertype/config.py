@@ -43,6 +43,10 @@ DEFAULTS = {
     "min_speech_seconds": 0.25,
     #: "auto" follows the system appearance; "dark" / "light" pin it.
     "theme": "auto",
+    #: The GPU sparkline is developer telemetry sitting above "am I
+    #: recording?". Off by default; the utilisation still shows as a chip
+    #: while a transcription is running.
+    "show_gpu_graph": False,
     #: "local" runs Whisper on this machine; "openai" sends the audio to
     #: OpenAI's hosted transcription API instead.
     "stt_engine": "local",

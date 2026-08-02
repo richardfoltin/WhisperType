@@ -14,6 +14,7 @@ constraints drive that choice:
 Every method below may be called from any thread; the ones the worker/recorder
 threads reach for marshal themselves onto the main queue.
 """
+import base64
 import os
 import subprocess
 import time
@@ -29,7 +30,12 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary, NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel, NSStatusWindowLevel,
 )
-from AppKit import NSAlert, NSAlertFirstButtonReturn, NSSecureTextField
+from AppKit import (NSAlert, NSAlertFirstButtonReturn, NSAppearance,
+                    NSBitmapImageRep, NSCompositingOperationSourceOver,
+                    NSPNGFileType, NSSecureTextField, NSViewHeightSizable,
+                    NSViewWidthSizable, NSVisualEffectBlendingModeBehindWindow,
+                    NSVisualEffectMaterialHUDWindow, NSVisualEffectStateActive,
+                    NSVisualEffectView, NSWorkspace, NSZeroRect)
 from Foundation import NSMakeRect, NSObject, NSOperationQueue, NSTimer
 from WebKit import WKWebView, WKWebViewConfiguration
 
@@ -43,6 +49,40 @@ OV_W = 380
 HTML_PATH = Path(__file__).with_name("overlay.html")
 
 from .common import ENGINES, IDLE_CHOICES, LANGUAGES
+
+
+_ICON_CACHE = {}
+
+
+def _app_icon_uri(bundle_id):
+    """The target app's icon as a data URI, for the history rows.
+
+    Cached per bundle id — a cold cache with a dozen distinct apps would
+    otherwise do a dozen disk lookups on the main thread in one go.
+    """
+    if not bundle_id:
+        return None
+    if bundle_id in _ICON_CACHE:
+        return _ICON_CACHE[bundle_id]
+    uri = None
+    try:
+        ws = NSWorkspace.sharedWorkspace()
+        url = ws.URLForApplicationWithBundleIdentifier_(bundle_id)
+        if url is not None:
+            src = ws.iconForFile_(url.path())
+            out = NSImage.alloc().initWithSize_((32, 32))       # 16pt @2x
+            out.lockFocus()
+            src.drawInRect_fromRect_operation_fraction_(
+                NSMakeRect(0, 0, 32, 32), NSZeroRect,
+                NSCompositingOperationSourceOver, 1.0)
+            out.unlockFocus()
+            rep = NSBitmapImageRep.alloc().initWithData_(out.TIFFRepresentation())
+            png = bytes(rep.representationUsingType_properties_(NSPNGFileType, {}))
+            uri = "data:image/png;base64," + base64.b64encode(png).decode()
+    except Exception as e:
+        log(f"Could not load the icon for {bundle_id}: {e}")
+    _ICON_CACHE[bundle_id] = uri
+    return uri
 
 
 def _input_device_names():
@@ -179,6 +219,7 @@ class AppKitUI:
         self._gpu_timer = None
         self._notice = None         # transient message, e.g. "Nothing heard"
         self._loading = None        # model name while it is being loaded
+        self._reduce_motion = False
 
         self._ns = NSApplication.sharedApplication()
         # Accessory: menu-bar only, no Dock icon, never becomes frontmost.
@@ -217,11 +258,27 @@ class AppKitUI:
         except Exception:
             pass
 
-        panel.setContentView_(web)
-        content = panel.contentView()
-        content.setWantsLayer_(True)
-        content.layer().setCornerRadius_(8.0)
-        content.layer().setMasksToBounds_(True)
+        # A real material instead of window alpha. Fading the whole window to
+        # 0.93 made the desktop show through the *letterforms*; macOS HUDs put
+        # an NSVisualEffectView behind opaque text instead.
+        vfx = NSVisualEffectView.alloc().initWithFrame_(rect)
+        vfx.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        vfx.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        # Load-bearing: we are an accessory app and never frontmost, so the
+        # default FollowsWindowActiveState would render the material flat.
+        vfx.setState_(NSVisualEffectStateActive)
+        vfx.setWantsLayer_(True)
+        vfx.layer().setCornerRadius_(16.0)      # 8pt is Big Sur-era; a real
+        try:                                    # popover measures 12-13pt
+            vfx.layer().setCornerCurve_("continuous")   # squircle, not a circle
+        except Exception:
+            pass
+        vfx.layer().setMasksToBounds_(True)
+
+        web.setFrame_(rect)
+        web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        vfx.addSubview_(web)
+        panel.setContentView_(vfx)
 
         web.loadHTMLString_baseURL_(HTML_PATH.read_text(encoding="utf-8"), None)
 
@@ -260,6 +317,8 @@ class AppKitUI:
             for script in self._pending:
                 self._web.evaluateJavaScript_completionHandler_(script, None)
             self._pending = []
+            self._apply_a11y()
+            self._apply_appearance()
         elif action == "height":
             self._set_height(int(msg["height"]))
         elif action == "drag":
@@ -278,6 +337,10 @@ class AppKitUI:
             pb.setString_forType_(msg.get("text", ""), NSPasteboardTypeString)
         elif action == "deleteHistory":
             self.app.jobs.delete_history(int(msg["index"]))
+            self._push_history()
+            self.refresh()
+        elif action == "clearHistory":
+            self.app.jobs.clear_history()
             self._push_history()
             self.refresh()
 
@@ -303,6 +366,9 @@ class AppKitUI:
                 x, y0 = self._default_origin()
                 top = y0 + h
         self._panel.setFrame_display_(NSMakeRect(x, top - h, OV_W, h), True)
+        # Without this the drop shadow keeps the silhouette of the previous
+        # frame, which is visible at every height change.
+        self._panel.invalidateShadow()
 
     def _drag(self, dx, dy):
         frame = self._panel.frame()
@@ -329,16 +395,19 @@ class AppKitUI:
         return "idle"
 
     def _hint(self, mode):
+        """Structured key/label pairs — the page renders them as keycaps
+        instead of a pipe-separated command line."""
         k = self.app.ptt_label
         if mode == "recording":
-            return (f"Transcribe: {k} / Enter↵ / "
-                    f"{self.app.cfg.silence_duration:.0f}s silence"
-                    f"  |  History: Space  |  Hide: Esc")
+            return [{"key": k, "label": "Transcribe"},
+                    {"key": "↩", "label": "Transcribe + Enter"},
+                    {"key": "⎋", "label": "Discard"}]
         if mode == "history":
-            return "Back: Space  |  Hide: Esc"
+            return [{"key": "⎋", "label": "Hide"}]
         if mode == "error":
-            return "Dismiss: Esc  |  History: menu bar ▸ History"
-        return f"Record: Double {k}  |  Hide: Esc"
+            return [{"key": "⎋", "label": "Dismiss"}]
+        return [{"key": k, "label": "Double-tap to record"},
+                {"key": "⎋", "label": "Hide"}]
 
     def _push_state(self, rec_start=None, target=None):
         mode = self._mode()
@@ -356,6 +425,8 @@ class AppKitUI:
             "hint": self._hint(mode),
             "message": message,
             "theme": self.app.cfg.theme,
+            "silenceHold": self.app.cfg.silence_duration,
+            "gpuGraph": bool(self.app.cfg.get("show_gpu_graph", False)),
             "gpuAvailable": bool(self.app.backend.gpu_available),
             "gpuLabel": self.app.backend.gpu_label,
         }
@@ -399,11 +470,14 @@ class AppKitUI:
         self._loading = None
 
     def _push_queue(self):
+        # Raw values: the page formats. The old 8-character truncation chopped
+        # app names mid-word regardless of the space available; text-overflow
+        # does it properly.
         items = [{
             "id": j.job_id,
-            "ts": time.strftime("%H:%M:%S", time.localtime(j.created_at)),
-            "dur": f"{j.audio_duration:.1f}s",
-            "app": (j.app_name[:8] if j.app_name else "?"),
+            "at": int(j.created_at),
+            "seconds": float(j.audio_duration),
+            "app": j.app_name or "?",
             "window": j.window_name,
             "status": "transcribing" if j.status == JobStatus.TRANSCRIBING else "waiting",
         } for j in self.app.jobs.active()]
@@ -412,7 +486,40 @@ class AppKitUI:
     def _push_history(self):
         entries = self.app.jobs.history()
         items = [dict(e, index=i) for i, e in enumerate(entries)]
-        self._js(f"wt.setHistory({_json(items)});")
+        # Real app icons are what make the list read as a native table rather
+        # than a web list. Cached per bundle id; only resolved on demand.
+        icons = {}
+        for entry in entries:
+            bundle = entry.get("bundle")
+            if bundle and bundle not in icons:
+                uri = _app_icon_uri(bundle)
+                if uri:
+                    icons[bundle] = uri
+        self._js(f"wt.setAppIcons({_json(icons)}); wt.setHistory({_json(items)});")
+
+    def _apply_appearance(self):
+        """Keep the material and the page's colour scheme in the same
+        appearance — otherwise a pinned theme only affects the HTML."""
+        name = {"light": "NSAppearanceNameAqua",
+                "dark": "NSAppearanceNameDarkAqua"}.get(self.app.cfg.theme)
+        self._panel.setAppearance_(
+            NSAppearance.appearanceNamed_(name) if name else None)
+
+    def _apply_a11y(self):
+        """prefers-reduced-transparency parses but never evaluates in this
+        WKWebView, so the accessibility flags have to come from NSWorkspace.
+        NSVisualEffectView honours Reduce Transparency by itself; this is only
+        so the page's own plates go opaque to match."""
+        try:
+            ws = NSWorkspace.sharedWorkspace()
+            self._reduce_motion = bool(ws.accessibilityDisplayShouldReduceMotion())
+            self._js(
+                "var d=document.documentElement.dataset;"
+                f"d.reduceTransparency='{int(ws.accessibilityDisplayShouldReduceTransparency())}';"
+                f"d.increaseContrast='{int(ws.accessibilityDisplayShouldIncreaseContrast())}';"
+                f"d.reduceMotion='{int(self._reduce_motion)}';")
+        except Exception as e:
+            log(f"Could not read accessibility settings: {e}")
 
     def _push_gpu(self):
         series = self.app.gpu_series()
@@ -484,7 +591,11 @@ class AppKitUI:
             self._panel.setFrame_display_(NSMakeRect(x, y, OV_W, self._height), True)
         # orderFrontRegardless shows the panel without activating the app.
         self._panel.orderFrontRegardless()
-        self._panel.setAlphaValue_(0.93)
+        # Fully opaque: the NSVisualEffectView provides the translucency now.
+        # Window alpha and a material are mutually exclusive ideas — the old
+        # 0.93 faded the text along with the background.
+        self._panel.setAlphaValue_(1.0)
+        self._panel.invalidateShadow()
         self.visible = True
         self._start_gpu_refresh()
 
