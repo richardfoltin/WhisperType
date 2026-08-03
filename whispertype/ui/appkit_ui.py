@@ -14,6 +14,7 @@ constraints drive that choice:
 Every method below may be called from any thread; the ones the worker/recorder
 threads reach for marshal themselves onto the main queue.
 """
+import base64
 import os
 import subprocess
 import time
@@ -29,24 +30,68 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary, NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel, NSStatusWindowLevel,
 )
+from AppKit import (NSAlert, NSAlertFirstButtonReturn, NSAppearance,
+                    NSBitmapImageRep, NSCompositingOperationSourceOver,
+                    NSPNGFileType, NSSecureTextField, NSViewHeightSizable,
+                    NSViewWidthSizable, NSVisualEffectBlendingModeBehindWindow,
+                    NSVisualEffectMaterialHUDWindow, NSVisualEffectStateActive,
+                    NSVisualEffectView, NSWorkspace, NSZeroRect)
 from Foundation import NSMakeRect, NSObject, NSOperationQueue, NSTimer
 from WebKit import WKWebView, WKWebViewConfiguration
 
 from .. import __version__
+from ..config import API_KEY_PATH
 from ..icon import png_bytes
 from ..jobs import JobStatus
 from ..log import LOG_PATH, log
 
 OV_W = 380
+
+#: Fixed panel heights. Sizing to content meant expanding a history row or
+#: showing a two-line error resized the window under the pointer; two stable
+#: sizes are calmer and still proportionate — a recording HUD should not be as
+#: tall as a 50-entry archive.
+OV_H_COMPACT = 212      # idle / recording / transcribing / notice / error
+OV_H_QUEUE = 300        # transcribing with jobs actually queued behind it
+OV_H_HISTORY = 470
+
 HTML_PATH = Path(__file__).with_name("overlay.html")
 
-#: Offered in the Language submenu. `language` is read fresh for every job, so
-#: switching takes effect on the next dictation with no restart.
-LANGUAGES = [
-    ("hu", "Magyar"), ("en", "English"), ("de", "Deutsch"),
-    ("fr", "Français"), ("es", "Español"), ("it", "Italiano"),
-    ("nl", "Nederlands"), ("pl", "Polski"), ("ja", "日本語"),
-]
+from .common import ENGINES, IDLE_CHOICES, LANGUAGES
+
+
+_ICON_CACHE = {}
+
+
+def _app_icon_uri(bundle_id):
+    """The target app's icon as a data URI, for the history rows.
+
+    Cached per bundle id — a cold cache with a dozen distinct apps would
+    otherwise do a dozen disk lookups on the main thread in one go.
+    """
+    if not bundle_id:
+        return None
+    if bundle_id in _ICON_CACHE:
+        return _ICON_CACHE[bundle_id]
+    uri = None
+    try:
+        ws = NSWorkspace.sharedWorkspace()
+        url = ws.URLForApplicationWithBundleIdentifier_(bundle_id)
+        if url is not None:
+            src = ws.iconForFile_(url.path())
+            out = NSImage.alloc().initWithSize_((32, 32))       # 16pt @2x
+            out.lockFocus()
+            src.drawInRect_fromRect_operation_fraction_(
+                NSMakeRect(0, 0, 32, 32), NSZeroRect,
+                NSCompositingOperationSourceOver, 1.0)
+            out.unlockFocus()
+            rep = NSBitmapImageRep.alloc().initWithData_(out.TIFFRepresentation())
+            png = bytes(rep.representationUsingType_properties_(NSPNGFileType, {}))
+            uri = "data:image/png;base64," + base64.b64encode(png).decode()
+    except Exception as e:
+        log(f"Could not load the icon for {bundle_id}: {e}")
+    _ICON_CACHE[bundle_id] = uri
+    return uri
 
 
 def _input_device_names():
@@ -118,6 +163,26 @@ class Bridge(NSObject):
         self._ui.app.cfg.save()
         self._ui.refresh_tray()
 
+    def engineSelected_(self, sender):
+        self._ui.app.request_engine(str(sender.representedObject()))
+
+    def apiKeySelected_(self, sender):
+        self._ui.ask_api_key()
+
+    def idleSelected_(self, sender):
+        self._ui.app.set_idle_unload(int(sender.representedObject()))
+        self._ui.refresh_tray()
+
+    def downloadAllSelected_(self, sender):
+        self._ui.app.download_all_models()
+
+    def benchmarkSelected_(self, sender):
+        self._ui.app.toggle_benchmark_next()
+        self._ui.refresh_tray()
+
+    def openBenchmarkSelected_(self, sender):
+        self._ui.app.open_last_benchmark()
+
     def historySelected_(self, sender):
         self._ui.app.show_history()
 
@@ -159,7 +224,7 @@ class AppKitUI:
         self.history_mode = False
 
         self._pos = None            # user-dragged position, screen coords
-        self._height = 120
+        self._height = OV_H_COMPACT
         self._ready = False
         self._pending = []          # JS calls queued until the page loads
         self._last_level = 0.0
@@ -167,6 +232,7 @@ class AppKitUI:
         self._gpu_timer = None
         self._notice = None         # transient message, e.g. "Nothing heard"
         self._loading = None        # model name while it is being loaded
+        self._reduce_motion = False
 
         self._ns = NSApplication.sharedApplication()
         # Accessory: menu-bar only, no Dock icon, never becomes frontmost.
@@ -205,11 +271,27 @@ class AppKitUI:
         except Exception:
             pass
 
-        panel.setContentView_(web)
-        content = panel.contentView()
-        content.setWantsLayer_(True)
-        content.layer().setCornerRadius_(8.0)
-        content.layer().setMasksToBounds_(True)
+        # A real material instead of window alpha. Fading the whole window to
+        # 0.93 made the desktop show through the *letterforms*; macOS HUDs put
+        # an NSVisualEffectView behind opaque text instead.
+        vfx = NSVisualEffectView.alloc().initWithFrame_(rect)
+        vfx.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        vfx.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        # Load-bearing: we are an accessory app and never frontmost, so the
+        # default FollowsWindowActiveState would render the material flat.
+        vfx.setState_(NSVisualEffectStateActive)
+        vfx.setWantsLayer_(True)
+        vfx.layer().setCornerRadius_(16.0)      # 8pt is Big Sur-era; a real
+        try:                                    # popover measures 12-13pt
+            vfx.layer().setCornerCurve_("continuous")   # squircle, not a circle
+        except Exception:
+            pass
+        vfx.layer().setMasksToBounds_(True)
+
+        web.setFrame_(rect)
+        web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        vfx.addSubview_(web)
+        panel.setContentView_(vfx)
 
         web.loadHTMLString_baseURL_(HTML_PATH.read_text(encoding="utf-8"), None)
 
@@ -248,8 +330,10 @@ class AppKitUI:
             for script in self._pending:
                 self._web.evaluateJavaScript_completionHandler_(script, None)
             self._pending = []
+            self._apply_a11y()
+            self._apply_appearance()
         elif action == "height":
-            self._set_height(int(msg["height"]))
+            pass        # the panel is a fixed size per mode; see _push_state
         elif action == "drag":
             self._drag(float(msg["dx"]), float(msg["dy"]))
         elif action == "hide":
@@ -266,6 +350,10 @@ class AppKitUI:
             pb.setString_forType_(msg.get("text", ""), NSPasteboardTypeString)
         elif action == "deleteHistory":
             self.app.jobs.delete_history(int(msg["index"]))
+            self._push_history()
+            self.refresh()
+        elif action == "clearHistory":
+            self.app.jobs.clear_history()
             self._push_history()
             self.refresh()
 
@@ -291,6 +379,9 @@ class AppKitUI:
                 x, y0 = self._default_origin()
                 top = y0 + h
         self._panel.setFrame_display_(NSMakeRect(x, top - h, OV_W, h), True)
+        # Without this the drop shadow keeps the silhouette of the previous
+        # frame, which is visible at every height change.
+        self._panel.invalidateShadow()
 
     def _drag(self, dx, dy):
         frame = self._panel.frame()
@@ -317,16 +408,19 @@ class AppKitUI:
         return "idle"
 
     def _hint(self, mode):
+        """Structured key/label pairs — the page renders them as keycaps
+        instead of a pipe-separated command line."""
         k = self.app.ptt_label
         if mode == "recording":
-            return (f"Transcribe: {k} / Enter↵ / "
-                    f"{self.app.cfg.silence_duration:.0f}s silence"
-                    f"  |  History: Space  |  Hide: Esc")
+            return [{"key": k, "label": "Transcribe"},
+                    {"key": "↩", "label": "Transcribe + Enter"},
+                    {"key": "⎋", "label": "Discard"}]
         if mode == "history":
-            return "Back: Space  |  Hide: Esc"
+            return [{"key": "⎋", "label": "Hide"}]
         if mode == "error":
-            return "Dismiss: Esc  |  History: menu bar ▸ History"
-        return f"Record: Double {k}  |  Hide: Esc"
+            return [{"key": "⎋", "label": "Dismiss"}]
+        return [{"key": k, "label": "Double-tap to record"},
+                {"key": "⎋", "label": "Hide"}]
 
     def _push_state(self, rec_start=None, target=None):
         mode = self._mode()
@@ -344,12 +438,28 @@ class AppKitUI:
             "hint": self._hint(mode),
             "message": message,
             "theme": self.app.cfg.theme,
+            "silenceHold": self.app.cfg.silence_duration,
+            "gpuGraph": bool(self.app.cfg.get("show_gpu_graph", False)),
             "gpuAvailable": bool(self.app.backend.gpu_available),
             "gpuLabel": self.app.backend.gpu_label,
         }
         if rec_start is not None:
             state["recStart"] = int(rec_start * 1000)
         self._js(f"wt.setState({_json(state)}); wt.setMode({_json(mode)});")
+        # Transcribing is the same size as recording — the header and the stage
+        # line up exactly — and only grows when a queue actually exists behind
+        # the job in flight.
+        if mode == "history":
+            height = OV_H_HISTORY
+        elif mode == "transcribing" and self.app.jobs.active_count() > 1:
+            height = OV_H_QUEUE
+        else:
+            height = OV_H_COMPACT
+        self._set_height(height)
+
+    def set_ticker(self, text):
+        """Show the finished transcript running in from the right."""
+        self.call_soon(lambda: self._js(f"wt.setTicker({_json(text or '')});"))
 
     # ── Transient states ──
 
@@ -387,11 +497,14 @@ class AppKitUI:
         self._loading = None
 
     def _push_queue(self):
+        # Raw values: the page formats. The old 8-character truncation chopped
+        # app names mid-word regardless of the space available; text-overflow
+        # does it properly.
         items = [{
             "id": j.job_id,
-            "ts": time.strftime("%H:%M:%S", time.localtime(j.created_at)),
-            "dur": f"{j.audio_duration:.1f}s",
-            "app": (j.app_name[:8] if j.app_name else "?"),
+            "at": int(j.created_at),
+            "seconds": float(j.audio_duration),
+            "app": j.app_name or "?",
             "window": j.window_name,
             "status": "transcribing" if j.status == JobStatus.TRANSCRIBING else "waiting",
         } for j in self.app.jobs.active()]
@@ -400,7 +513,40 @@ class AppKitUI:
     def _push_history(self):
         entries = self.app.jobs.history()
         items = [dict(e, index=i) for i, e in enumerate(entries)]
-        self._js(f"wt.setHistory({_json(items)});")
+        # Real app icons are what make the list read as a native table rather
+        # than a web list. Cached per bundle id; only resolved on demand.
+        icons = {}
+        for entry in entries:
+            bundle = entry.get("bundle")
+            if bundle and bundle not in icons:
+                uri = _app_icon_uri(bundle)
+                if uri:
+                    icons[bundle] = uri
+        self._js(f"wt.setAppIcons({_json(icons)}); wt.setHistory({_json(items)});")
+
+    def _apply_appearance(self):
+        """Keep the material and the page's colour scheme in the same
+        appearance — otherwise a pinned theme only affects the HTML."""
+        name = {"light": "NSAppearanceNameAqua",
+                "dark": "NSAppearanceNameDarkAqua"}.get(self.app.cfg.theme)
+        self._panel.setAppearance_(
+            NSAppearance.appearanceNamed_(name) if name else None)
+
+    def _apply_a11y(self):
+        """prefers-reduced-transparency parses but never evaluates in this
+        WKWebView, so the accessibility flags have to come from NSWorkspace.
+        NSVisualEffectView honours Reduce Transparency by itself; this is only
+        so the page's own plates go opaque to match."""
+        try:
+            ws = NSWorkspace.sharedWorkspace()
+            self._reduce_motion = bool(ws.accessibilityDisplayShouldReduceMotion())
+            self._js(
+                "var d=document.documentElement.dataset;"
+                f"d.reduceTransparency='{int(ws.accessibilityDisplayShouldReduceTransparency())}';"
+                f"d.increaseContrast='{int(ws.accessibilityDisplayShouldIncreaseContrast())}';"
+                f"d.reduceMotion='{int(self._reduce_motion)}';")
+        except Exception as e:
+            log(f"Could not read accessibility settings: {e}")
 
     def _push_gpu(self):
         series = self.app.gpu_series()
@@ -472,7 +618,11 @@ class AppKitUI:
             self._panel.setFrame_display_(NSMakeRect(x, y, OV_W, self._height), True)
         # orderFrontRegardless shows the panel without activating the app.
         self._panel.orderFrontRegardless()
-        self._panel.setAlphaValue_(0.93)
+        # Fully opaque: the NSVisualEffectView provides the translucency now.
+        # Window alpha and a material are mutually exclusive ideas — the old
+        # 0.93 faded the text along with the background.
+        self._panel.setAlphaValue_(1.0)
+        self._panel.invalidateShadow()
         self.visible = True
         self._start_gpu_refresh()
 
@@ -555,6 +705,18 @@ class AppKitUI:
 
         menu.addItem_(NSMenuItem.separatorItem())
 
+        local = app.engine_kind == "local"
+
+        engines = self._submenu(menu, "Engine")
+        for kind, label in ENGINES:
+            self._item(engines, label, "engineSelected:", obj=kind,
+                       state=1 if kind == app.engine_kind else 0)
+        engines.addItem_(NSMenuItem.separatorItem())
+        source = app.cfg.api_key_source
+        self._item(engines,
+                   "Set API key…" if not source else f"Replace API key ({source})…",
+                   "apiKeySelected:")
+
         models = self._submenu(menu, "Model")
         for info in app.model_catalog():
             label = f"{info.name}   {info.size_label}"
@@ -577,7 +739,27 @@ class AppKitUI:
             self._item(mics, name, "micSelected:", obj=name,
                        state=1 if current_mic and str(current_mic) in name else 0)
 
+        # Only meaningful for the local engine — the hosted models live on
+        # OpenAI's servers and there is nothing to unload or download.
+        if local:
+            idle = self._submenu(menu, "Release model when idle")
+            for minutes, label in IDLE_CHOICES:
+                self._item(idle, label, "idleSelected:", obj=minutes,
+                           state=1 if abs(app.cfg.idle_unload_seconds
+                                          - minutes * 60) < 1 else 0)
+
+            pending = any(not i.downloaded for i in app.model_catalog())
+            self._item(menu, "Download all models", "downloadAllSelected:",
+                       enabled=(pending and not app.downloading_all))
+
         menu.addItem_(NSMenuItem.separatorItem())
+        if app.benchmark_supported():
+            self._item(menu, "Benchmark next recording", "benchmarkSelected:",
+                       state=1 if app.benchmark_next else 0)
+            self._item(menu, "Open last benchmark", "openBenchmarkSelected:",
+                       enabled=app.last_benchmark is not None)
+            menu.addItem_(NSMenuItem.separatorItem())
+
         self._item(menu, "Open Log", "openLogSelected:")
         self._item(menu, "Restart WhisperType", "restartSelected:")
         menu.addItem_(NSMenuItem.separatorItem())
@@ -587,6 +769,47 @@ class AppKitUI:
         self._apply_tray_state(self._tray_state or "idle")
 
     # ── Menu actions that touch the system ──
+
+    def ask_api_key(self):
+        self.call_soon(self._ask_api_key)
+
+    def _ask_api_key(self):
+        """Prompt for the OpenAI key in a standard sheet-less NSAlert.
+
+        The app runs as an accessory with a non-activating panel and normally
+        has no key window, so it has to activate itself for the duration of the
+        modal — otherwise the secure field cannot receive keystrokes. We hide
+        again afterwards so focus goes back where the user left it.
+        """
+        source = self.app.cfg.api_key_source
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("OpenAI API key")
+        alert.setInformativeText_(
+            (f"A key is already set (from the {source}). Entering a new one "
+             f"replaces it.\n\n" if source else "No key is set yet.\n\n")
+            + f"The key is stored in {API_KEY_PATH}, readable only by you — "
+              f"never in config.json, and never inside the repository.")
+        field = NSSecureTextField.alloc().initWithFrame_(
+            NSMakeRect(0, 0, 320, 24))
+        field.setPlaceholderString_("sk-…")
+        alert.setAccessoryView_(field)
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Cancel")
+
+        self._ns.activateIgnoringOtherApps_(True)
+        alert.window().makeFirstResponder_(field)
+        clicked = alert.runModal()
+        key = str(field.stringValue()).strip()
+        self._ns.hide_(None)
+
+        if clicked != NSAlertFirstButtonReturn or not key:
+            return
+        if not key.startswith("sk-"):
+            # Cheap sanity check — a mistyped key otherwise only shows up as a
+            # 401 on the next dictation.
+            self.app.set_error("That does not look like an OpenAI key (sk-…)")
+            return
+        self.app.set_api_key(key)
 
     def open_log(self):
         subprocess.Popen(["/usr/bin/open", "-a", "Console", str(LOG_PATH)])

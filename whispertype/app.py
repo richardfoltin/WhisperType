@@ -437,9 +437,15 @@ class App:
             log(f"Skipped cancelled job {job.job_id}")
             return
         entry = {
+            # `at` and `secs` are the raw values the UI formats and groups by;
+            # `ts`/`dur` stay for tk_ui and for history.json written by older
+            # builds. `app` is no longer truncated — the view ellipsises.
+            "at": int(job.created_at),
+            "secs": round(job.audio_duration, 2),
             "ts": time.strftime("%H:%M:%S", time.localtime(job.created_at)),
             "dur": f"{job.audio_duration:.1f}s",
-            "app": job.app_name[:8] if job.app_name else "?",
+            "app": job.app_name or "?",
+            "bundle": getattr(job.target, "bundle_id", "") or "",
             "window": job.window_name,
             "text": "",
         }
@@ -454,6 +460,9 @@ class App:
 
             if not text:
                 return
+            # Run it across the overlay before it is typed, so there is a
+            # moment where you can see what is about to land in your document.
+            self.ui.set_ticker(text)
             entry["text"] = text
             self.jobs.add_history(entry)
 
@@ -472,7 +481,9 @@ class App:
         finally:
             self.jobs.finish(job)
             self.ui.call_soon(self.ui.refresh)
-            self.ui.call_later(100, self.ui.check_hide)
+            # Long enough for the transcript to finish running across the
+            # overlay (~700ms) before it disappears.
+            self.ui.call_later(900, self.ui.check_hide)
             if not self.jobs.busy() and not self.recording:
                 self.ui.set_tray_state("error" if self.last_error else "idle")
 
@@ -896,9 +907,9 @@ class App:
         # Scoped to the states where the user is actually interacting with the
         # overlay. Gating on "overlay visible" meant every space bar pressed in
         # another app during a transcription toggled history mode.
-        if key == K.space and (self.recording or self.ui.history_mode):
-            self.ui.call_soon(self.toggle_history)
-            return
+        # History is a menu-bar item now. Binding it to Space meant a key you
+        # press constantly was being watched globally for the whole time the
+        # overlay happened to be up.
 
         if key == K.esc and self.ui.visible:
             if self.recording:

@@ -29,23 +29,7 @@ MAX_QUEUE_VISIBLE = 5
 VISIBLE_HISTORY = 8
 HISTORY_ITEM_H = 22
 
-#: Offered in the Language submenu — the same list the macOS menu bar shows.
-#: `language` is read fresh for every job, so switching needs no restart.
-LANGUAGES = [
-    ("en", "English"), ("hu", "Magyar"), ("de", "Deutsch"),
-    ("fr", "Français"), ("es", "Español"), ("it", "Italiano"),
-    ("pt", "Português"), ("nl", "Nederlands"), ("pl", "Polski"),
-    ("ru", "Русский"), ("ja", "日本語"), ("zh", "中文"),
-]
-
-#: Idle-unload choices. Reloading from the local cache costs about a second,
-#: so holding ~1.6 GB resident all day for a tool used a few times an hour is
-#: a bad trade — but it is a trade, so it is a setting.
-IDLE_CHOICES = [
-    (0, "Never (keep resident)"), (2, "After 2 minutes"),
-    (5, "After 5 minutes"), (10, "After 10 minutes"),
-    (30, "After 30 minutes"), (60, "After 1 hour"),
-]
+from .common import IDLE_CHOICES, LANGUAGES  # noqa: F401  (menu content)
 
 
 class _Slider(tk.Canvas):
@@ -580,6 +564,9 @@ class TkUI:
             self.refresh()
             self.root.after(int(seconds * 1000), self._clear_message)
         self.root.after(0, run)
+
+    def set_ticker(self, text):
+        """No-op on Windows: the tkinter overlay has no ticker strip."""
 
     def show_loading(self, model_name):
         self.root.after(0, lambda: (setattr(self, "_message",

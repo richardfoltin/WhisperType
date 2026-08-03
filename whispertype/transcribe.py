@@ -96,10 +96,20 @@ def report_prompt_budget(language):
     prompt = initial_prompt()
     if not prompt:
         return
+    # Same tokenizer, two packagings: openai-whisper on Windows, mlx-whisper on
+    # macOS. Only one of them is ever installed.
+    get_tokenizer = None
+    for module in ("whisper.tokenizer", "mlx_whisper.tokenizer"):
+        try:
+            get_tokenizer = __import__(module, fromlist=["get_tokenizer"]).get_tokenizer
+            break
+        except ImportError:
+            continue
+    if get_tokenizer is None:
+        return          # hosted API engine: no local tokenizer, nothing to say
     try:
-        import whisper.tokenizer
-        tok = whisper.tokenizer.get_tokenizer(
-            multilingual=True, language=language, task="transcribe")
+        tok = get_tokenizer(multilingual=True, language=language,
+                            task="transcribe")
         toks = tok.encode(" " + prompt)
     except Exception as e:
         log(f"Could not measure the initial prompt ({e})")
@@ -250,17 +260,36 @@ class MlxEngine:
     """mlx-whisper — runs on the Apple GPU via Metal."""
 
     # mlx-community repo names are not uniform: most carry an `-mlx` suffix,
-    # large-v3-turbo and tiny do not. Sizes are the real repo sizes (fp32
-    # weights, so roughly double the openai .pt files).
+    # large-v3-turbo and tiny do not. Sizes are the real repo sizes, measured
+    # from the HF tree API.
+    #
+    # `large-v3-turbo-q4` is the same model at 464 MB instead of 1.6 GB, which
+    # also cuts the reload after an idle unload by the same factor. Measured on
+    # 10.7s of Hungarian speech: identical transcript to the fp16 build, 0.75s
+    # vs 0.74s. Worth being the default for most people.
+    #
+    # Deliberately not offered:
+    #   * the `-8bit` and `-4bit` turbo repos — they ship `model.safetensors`,
+    #     and mlx-whisper 0.4.3 only reads `weights.npz`, so loading one raises
+    #     "[load_npz] Input must be a zip file". Verified, not assumed.
+    #   * the `.en` and distil-whisper repos: English only.
+    #   * `large-v3-mlx-4bit`: its repo carries both npz and safetensors, so it
+    #     is barely smaller than the fp16 turbo.
     REPOS = {
-        "large-v3-turbo": ("mlx-community/whisper-large-v3-turbo", "1.6 GB"),
-        "large-v3":       ("mlx-community/whisper-large-v3-mlx",   "3.1 GB"),
-        "large-v2":       ("mlx-community/whisper-large-v2-mlx",   "3.1 GB"),
-        "medium":         ("mlx-community/whisper-medium-mlx",     "1.5 GB"),
-        "small":          ("mlx-community/whisper-small-mlx",      "481 MB"),
-        "base":           ("mlx-community/whisper-base-mlx",       "144 MB"),
-        "tiny":           ("mlx-community/whisper-tiny",            "74 MB"),
+        "large-v3-turbo":    ("mlx-community/whisper-large-v3-turbo",    "1.6 GB"),
+        "large-v3-turbo-q4": ("mlx-community/whisper-large-v3-turbo-q4", "464 MB"),
+        "large-v3":          ("mlx-community/whisper-large-v3-mlx",      "3.1 GB"),
+        "large-v2":          ("mlx-community/whisper-large-v2-mlx",      "3.1 GB"),
+        "medium":            ("mlx-community/whisper-medium-mlx",        "1.5 GB"),
+        "small":             ("mlx-community/whisper-small-mlx",         "481 MB"),
+        "base":              ("mlx-community/whisper-base-mlx",          "144 MB"),
+        "tiny":              ("mlx-community/whisper-tiny",               "74 MB"),
     }
+
+    #: Menu order. Separate from the Windows engine's list, which can only
+    #: offer what openai-whisper ships.
+    ORDER = ["large-v3-turbo", "large-v3-turbo-q4",
+             "large-v3", "large-v2", "medium", "small", "base", "tiny"]
 
     def __init__(self):
         import mlx.core as mx
@@ -299,7 +328,7 @@ class MlxEngine:
 
     def catalog(self):
         return [ModelInfo(n, self.REPOS[n][1], self.is_downloaded(n))
-                for n in _MODEL_ORDER]
+                for n in self.ORDER]
 
     def load(self, name):
         repo, _ = self.REPOS[name]
@@ -381,12 +410,21 @@ OPENAI_FALLBACK_MODELS = [
 #: What counts as a speech-to-text model in /v1/models. Without a filter the
 #: TTS models (tts-1*) leak into the same list.
 #:
-#: The gpt-realtime* family is deliberately excluded: those are websocket
-#: session models, POST /v1/audio/transcriptions answers 404 "Invalid URL" for
-#: them, and offering a menu entry that silently transcribes with something
-#: else is worse than not offering it. _HTTP_FALLBACK still covers a config
-#: that names one by hand.
-_OPENAI_STT_RE = re.compile(r"^(whisper-|gpt-4o.*transcribe)")
+#: Matched on the *capability word* rather than on a family prefix. The old
+#: pattern was `^(whisper-|gpt-4o.*transcribe)`, which pinned the list to one
+#: generation: a future `gpt-5-transcribe` or `o4-transcribe` would simply not
+#: appear in the menu, with nothing to explain why.
+_OPENAI_STT_RE = re.compile(r"(^whisper-|transcrib)")
+
+#: Excluded even when they match above.
+#:
+#: The gpt-realtime* family are websocket session models: POST
+#: /v1/audio/transcriptions answers 404 "Invalid URL" for them, and offering a
+#: menu entry that silently transcribes with something else is worse than not
+#: offering it. _HTTP_FALLBACK still covers a config that names one by hand.
+#: `tts` and `speech` catch the text-to-speech side, which also carries
+#: audio-ish names.
+_OPENAI_NOT_STT_RE = re.compile(r"(^gpt-realtime|tts|[-_]speech|^dall|embedding)")
 
 #: Dated snapshots (…-2025-12-15) are reproducibility pins of the evergreen
 #: base model; hiding them keeps the menu scannable.
@@ -480,7 +518,8 @@ class OpenAiEngine:
                 data = json.load(resp)
             names = sorted(
                 m["id"] for m in data.get("data", [])
-                if _OPENAI_STT_RE.match(m.get("id", ""))
+                if _OPENAI_STT_RE.search(m.get("id", ""))
+                and not _OPENAI_NOT_STT_RE.search(m.get("id", ""))
                 and not _OPENAI_PINNED_RE.search(m.get("id", "")))
             self._models = names or list(OPENAI_FALLBACK_MODELS)
             log(f"OpenAI STT models: {', '.join(self._models)}")
