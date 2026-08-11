@@ -4,7 +4,9 @@ Windows keeps PyAudio (unchanged behaviour); macOS uses sounddevice, whose
 wheel ships its own libportaudio.dylib so no Homebrew/PortAudio build is
 needed. Both produce identical output: raw 16-bit mono PCM at cfg.rate.
 """
+import locale
 import sys
+import threading
 import time
 
 import numpy as np
@@ -116,30 +118,73 @@ class _SoundDeviceStream:
 
 _backend = None
 _device_cache = {}
+_device_list = None
+
+#: PortAudio is not thread-safe, and this module is reached from three threads:
+#: the recorder, the tray (which lists devices for its Microphone submenu) and
+#: the Tk thread (the settings window). Two of them constructing the backend at
+#: once initialised PortAudio twice and took the whole process down natively —
+#: no traceback, no log line, just a daemon that was there a second ago.
+#: Everything that calls into PortAudio holds this; only stream.read() runs
+#: outside it, which is what keeps a recording in progress from blocking the
+#: menu.
+_pa_lock = threading.RLock()
 
 
 def backend():
-    global _backend
-    if _backend is None:
-        _backend = _SoundDeviceBackend() if IS_MAC else _PyAudioBackend()
-    return _backend
+    with _pa_lock:
+        global _backend
+        if _backend is None:
+            _backend = _SoundDeviceBackend() if IS_MAC else _PyAudioBackend()
+        return _backend
 
 
 def reset_device_cache():
     """Called when the configured device changes, so the next recording opens
     the new one rather than the cached lookup."""
-    _device_cache.clear()
+    global _device_list
+    with _pa_lock:
+        _device_cache.clear()
+        _device_list = None
 
 
 def resolve_device(spec):
     """Cached device lookup — record_until_stop runs this on every recording."""
-    key = repr(spec)
-    if key not in _device_cache:
-        idx = backend().resolve_device(spec)
-        _device_cache[key] = idx
-        if idx is not None:
-            log(f"Capture device resolved: {spec!r} -> index {idx}")
-    return _device_cache[key]
+    with _pa_lock:
+        key = repr(spec)
+        if key not in _device_cache:
+            idx = backend().resolve_device(spec)
+            _device_cache[key] = idx
+            if idx is not None:
+                log(f"Capture device resolved: {spec!r} -> index {idx}")
+        return _device_cache[key]
+
+
+def _clean_name(name):
+    """Repair a capture device's name for display.
+
+    PortAudio writes UTF-8 into the MME device names, and PyAudio decodes them
+    with the process's ANSI code page — so on a Hungarian Windows "hangleképző"
+    arrives as "hanglekĂ©pzĹ‘". Re-encoding with that code page and decoding as
+    UTF-8 undoes it, and the round trip is self-checking: a name that was never
+    mangled cannot survive it, so it raises and the original is kept.
+
+    Some Bluetooth device names also carry an embedded newline, which turns one
+    menu item into three.
+    """
+    name = str(name)
+    try:
+        repaired = name.encode(locale.getpreferredencoding(False)).decode("utf-8")
+    except (UnicodeError, LookupError):
+        repaired = name
+    return " ".join(repaired.split())
+
+
+def open_stream(cfg, device):
+    """The one place a capture stream is opened, so the open is serialised
+    against every other PortAudio call."""
+    with _pa_lock:
+        return backend().open(cfg.rate, cfg.chunk, device=device)
 
 
 def list_input_devices():
@@ -147,22 +192,33 @@ def list_input_devices():
 
     Windows routinely exposes the same physical microphone several times over
     different host APIs, so the index matters as much as the name.
+
+    Cached: the tray menu is rebuilt on every state change, and re-enumerating
+    the sound hardware each time is both slow and one more chance to be inside
+    PortAudio when something else needs to be.
     """
-    out = []
-    try:
-        b = backend()
-        if IS_MAC:
-            for idx, dev in enumerate(b._sd.query_devices()):
-                if dev["max_input_channels"] > 0:
-                    out.append((idx, dev["name"]))
-        else:
-            for idx in range(b._pa.get_device_count()):
-                info = b._pa.get_device_info_by_index(idx)
-                if info.get("maxInputChannels", 0) > 0:
-                    out.append((idx, str(info.get("name", f"device {idx}"))))
-    except Exception as e:
-        log(f"Could not list input devices: {e}")
-    return out
+    global _device_list
+    with _pa_lock:
+        if _device_list is not None:
+            return list(_device_list)
+        out = []
+        try:
+            b = backend()
+            if IS_MAC:
+                for idx, dev in enumerate(b._sd.query_devices()):
+                    if dev["max_input_channels"] > 0:
+                        out.append((idx, _clean_name(dev["name"])))
+            else:
+                for idx in range(b._pa.get_device_count()):
+                    info = b._pa.get_device_info_by_index(idx)
+                    if info.get("maxInputChannels", 0) > 0:
+                        out.append((idx, _clean_name(
+                            info.get("name", f"device {idx}"))))
+        except Exception as e:
+            log(f"Could not list input devices: {e}")
+            return out          # not cached: a failed probe should be retried
+        _device_list = out
+        return list(out)
 
 
 class Capture:
@@ -193,7 +249,7 @@ def warm_up(cfg):
     """
     t0 = time.time()
     dev = resolve_device(cfg.input_device)
-    stream = backend().open(cfg.rate, cfg.chunk, device=dev)
+    stream = open_stream(cfg, dev)
     # Sample the idle noise floor while we are here. It is the number you need
     # to pick silence_threshold sensibly, and a mic whose floor sits above the
     # threshold can never auto-stop while one that returns digital zero gives
@@ -208,7 +264,8 @@ def warm_up(cfg):
     except Exception as e:
         log(f"Idle level probe failed: {e}")
     finally:
-        stream.close()
+        with _pa_lock:
+            stream.close()
     log(f"Audio device warm ({time.time() - t0:.2f}s) | "
         f"idle noise floor RMS {floor:.1f}, silence_threshold {cfg.silence_threshold:.0f}")
     return floor
@@ -221,7 +278,7 @@ def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None)
     start its timer from that instant rather than from the keypress.
     """
     dev = resolve_device(cfg.input_device)
-    stream = backend().open(cfg.rate, cfg.chunk, device=dev)
+    stream = open_stream(cfg, dev)
     frames = []
     silence_since = None
     speech_seconds = 0.0
@@ -263,7 +320,8 @@ def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None)
                 break
     finally:
         try:
-            stream.close()
+            with _pa_lock:
+                stream.close()
         except Exception as e:
             log(f"Error closing audio stream: {e}")
 

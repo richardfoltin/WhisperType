@@ -69,14 +69,13 @@ To remove everything it created:
 | Stop recording | **Right Ctrl** (single tap) |
 | Stop recording **and press Enter** in the target app | **Enter** (while recording) |
 | Auto-stop | `silence_duration` seconds of silence (default 3, `0` disables it) |
-| Open history | **Space** (while recording), or the tray / menu bar |
-| Leave history | **Space** |
+| Open history | Tray / menu bar ▸ **Show history** |
 | Hide overlay (discards a recording in progress) | **Esc** |
 | Change any setting | Tray / menu bar ▸ **Settings…** |
 | Switch model | Tray / menu bar ▸ Model |
 | Exit | Tray / menu bar ▸ Exit |
 
-Space and Esc are only intercepted while you are actually recording or in history — they behave normally in your other apps the rest of the time, including while a transcription is still running.
+Esc is the only key WhisperType watches besides the hotkey, and only while the overlay is on screen. History used to be on Space; it is a menu item now, because watching a key you press constantly — globally, for as long as the overlay happened to be up — was never a good trade.
 
 1. Double-tap **Right Ctrl** to start recording — a floating overlay appears
 2. Speak naturally
@@ -92,24 +91,18 @@ Text is injected directly via keystrokes — no clipboard involved, works in any
 | **Right Ctrl** | transcribed |
 | **Enter** | transcribed, then Enter is sent to the target app |
 | 3 s of silence, or the length limit | transcribed |
-| **Space** (jump to history) | **transcribed** — glancing at history never costs you a dictation |
 | **Esc** (minimize to tray) | discarded |
 | Opening the benchmark panel | discarded |
-| Tray → **Exit** | discarded — history is in memory, so there is nowhere for the text to survive to |
+| Tray → **Exit** | kept — it finishes transcribing and lands in history, it is just not typed |
 
-Esc is the deliberate "forget this one" gesture; Space is not. Every discard is
-written to `voice_daemon.log`, so nothing disappears without a trace.
+Esc is the deliberate "forget this one" gesture. Every discard is written to
+`voice_daemon.log`, so nothing disappears without a trace.
 
-### When Space and Esc are WhisperType keys
+### When Esc is a WhisperType key
 
-Space and Esc are only intercepted while WhisperType actually owns the keyboard:
-you are recording, the history or benchmark panel is open, or you have clicked
-the overlay. They are **not** intercepted merely because the overlay is on
-screen waiting for the queue to drain — otherwise every space you typed into
-your editor during a transcription would pop the history panel open.
-
-If the overlay is up but not focused, use **Show history** in the tray menu, or
-click the overlay first.
+Esc is only intercepted while the overlay is on screen. It behaves normally in
+your other apps the rest of the time — including while a transcription you
+started is still running, as long as you have hidden the overlay.
 
 ---
 
@@ -133,43 +126,51 @@ If that window is gone by the time the text is ready, WhisperType refuses to typ
 The floating overlay appears during recording and while transcriptions are queued:
 
 ```
-+--------------------------------------+
-| WhisperType                       x  |  Drag to reposition / x hides it
-+--------------------------------------+
-| GPU  ||||||||......          67%     |  GPU utilization graph (last 60s)
-+--------------------------------------+
-| * Recording              0:42       |  Live recording status
-| Model: large-v3-turbo               |
-| [========...........|..............]  |  Audio level + silence threshold
-| Transcribe: R-Ctrl / Enter / 3s ... |  Context-aware keyboard hints
-+--------------------------------------+
-| TIME      DUR   APP      WINDOW     |  Transcription queue
-| 10:04:21  1.2s  Code     server.ts  |  Currently transcribing (gold)
-| 10:04:35  0.8s  Chrome   ChatGPT..  |  Waiting (gray)
-+--------------------------------------+
++---------------------------------------+
+| WhisperType                        x  |  Drag to reposition / x hides it
++---------------------------------------+
+| * Recording                     0:42  |  Live status and elapsed time
+| Model: large-v3-turbo   -> server.ts  |  Where the text is going
+|                                       |
+|          .||ıı|||ı..ıı|||||ı.         |  The last few seconds of audio
+|          ------------_________        |  Run-up to the silence auto-stop
+|                                       |
+|   [R-Ctrl] Transcribe  [Esc] Discard  |  Context-aware keyboard hints
++---------------------------------------+
 ```
 
-The overlay shows different states:
+The panel is a fixed size per state, so changing state never resizes the window
+under your pointer. The states:
 
-- **Recording** — red blinking dot, audio level meter, timer
-- **Transcribing** — yellow dot, queue with progress (the **×** on a row cancels that job)
-- **History** — green dot, last 50 transcriptions with copy/delete buttons
-- **Benchmark** — one row per model, with timings and text previews
+- **Recording** — red blinking dot, a scrolling waveform of the last few seconds, and a hairline that fills as the silence auto-stop counts down, so a recording that ends itself is never a mystery
+- **Transcribing** — amber dot; the finished transcript runs in from the right before it is typed, so there is a moment where you can see what is about to land in your document. A queue list appears only when something is genuinely waiting behind the job in flight (the **×** on a row cancels that job)
+- **History** — the last 50 transcriptions
+- **Failed** — the reason, in the middle of the panel, until you press Esc
+- **Benchmark** (Windows) — one row per model, with timings and text previews
 
-The GPU graph collects data in the background from startup, so it's ready instantly when the overlay appears.
+The GPU graph is **off by default** — it is developer telemetry sitting above
+"am I recording?". Turn it on in Settings ▸ Appearance; either way the
+utilisation still appears as a small chip while a transcription runs.
+
+The overlay appears on the display your pointer is on, and a position you have
+dragged it to is kept only while it is still on that display — otherwise it
+would reappear on a screen you are not looking at, which is indistinguishable
+from the app not having started.
 
 ### History
 
-Press **Space** to open history — a list of your last 50 transcriptions (8 visible, scroll for the rest). Each entry shows the timestamp, duration, source app, window name, and has:
+Open it from the tray / menu bar ▸ **Show history**: your last 50
+transcriptions, grouped by day, newest first. Each row leads with the icon of
+the app the text was meant for and shows the transcript itself as the largest
+thing in the row, because that is the only thing anyone is scanning for.
 
-- **Copy button** — copies the transcription to clipboard (hover to preview the text)
-- **Delete button** — removes the entry from history
+- Long transcripts clamp to a few lines with a **Show more** disclosure and a word count
+- Hovering a row swaps its timestamp for **Copy** and **✕**, in a fixed-width slot so nothing moves
+- **Clear All** arms on the first click and only clears on the second
 
-Press **Space** again to close history and start a new recording.
-
-If you were recording when you pressed Space, **that recording is still transcribed** — it goes into the queue exactly as if you had tapped Right Ctrl. Glancing at your history never costs you a dictation.
-
-Nothing is ever lost to a failed hand-off: if the target window has closed, or the text was cancelled mid-transcription, it still lands in history for you to copy.
+Nothing is ever lost to a failed hand-off: if the target window has closed, if
+it turned out to be running as administrator, or if the text was cancelled
+mid-transcription, it still lands here for you to copy.
 
 ---
 
@@ -242,20 +243,25 @@ Check `voice_daemon.log` after editing the file. A comma-separated word list use
 
 ---
 
-## The menu bar (macOS)
+## The tray menu / menu bar
 
-Everything you need day to day is in the menu-bar menu, so you never have to
-edit JSON for the common cases:
+Everything you need day to day is in the menu, so you never have to edit JSON
+for the common cases. Both platforms offer the same items:
 
 | Item | Notes |
 |---|---|
-| **History…** | Opens the history list without starting a recording |
+| **Settings…** (Windows) | One window with everything, because a Win32 tray menu closes on every click |
+| **Show history** | Opens the history list without starting a recording |
 | **Pause dictation** | Ignores the hotkey until you switch it back; the icon shows a struck-through mic |
+| **Engine** | Local model or the OpenAI API, plus where the API key goes |
 | **Model** | Runtime switch. `↓` means not downloaded yet |
 | **Language** | Takes effect on the very next dictation, no restart |
 | **Microphone** | Same. Pin the built-in mic here so recording does not drop AirPods into call quality |
-| **Open Log** | Opens `voice_daemon.log` in Console |
+| **Open log** | Opens `voice_daemon.log` |
 | **Restart WhisperType** | Needed only after changing the hotkey |
+
+The first line of the menu says what the app is doing when it is not obvious:
+the error, or which model is still loading.
 
 The icon colour is the app's status at a glance: green ready, red recording,
 amber transcribing, grey downloading or loading, **red exclamation mark** when
@@ -266,9 +272,12 @@ something failed, struck-through when paused.
 A transcript that cannot be delivered is never silently dropped. The overlay
 stays on screen with the reason, the menu-bar icon turns into a red exclamation
 mark, and the text is kept in history so you can copy it. Press **Esc** to
-dismiss. This covers: the target app quit, a password field took secure input,
-the Accessibility permission was revoked, the microphone was unavailable, the
-model failed to load, or transcription itself threw.
+dismiss. This covers: the target app quit, a password field took secure input
+(macOS), the target window turned out to be running as administrator (Windows —
+the system drops synthetic keystrokes aimed at a higher integrity level, and
+reports success while doing it), the Accessibility permission was revoked, the
+microphone was unavailable, the model failed to load, or transcription itself
+threw.
 
 History is written to `~/.whispertype/history.json`, so it survives quitting and
 logging out — which matters precisely because it is where undeliverable text
@@ -316,7 +325,8 @@ The submenus remain for a quick one-off change. Everything below can also be edi
 | `fp16` | `true` on GPU | Half-precision inference (Windows/CUDA). Forced off on CPU |
 | `min_speech_seconds` | `0.25` | A clip with less speech than this is discarded instead of transcribed. Whisper reliably invents a sentence for silence, and an accidental double-tap would otherwise type it into your document. |
 | `idle_unload_minutes` | `10` | Release the model after this many idle minutes (`0` = keep it resident). Measured: 1799 MB → 260 MB, and reloading from the local cache takes about a second. |
-| `theme` | `"auto"` | Overlay appearance: `auto` follows the system, or pin it with `dark` / `light`. |
+| `theme` | `"auto"` | Overlay appearance: `auto` follows the system light/dark setting (re-read every time the overlay appears), or pin it with `dark` / `light`. On Windows the accent colour is taken from Windows too, and corrected until it is legible on the panel. |
+| `show_gpu_graph` | `false` | Draw the 60-second utilisation graph on the overlay. Off because it sits above "am I recording?"; the number still shows as a chip while transcribing. |
 | `stt_engine` | `"local"` | `local` runs Whisper here; `openai` uses the hosted API (see above) |
 | `openai_model` | `"gpt-4o-transcribe"` | Model used in API mode |
 | `openai_endpoint` | `https://api.openai.com/v1` | Override for an Azure/compatible endpoint |
@@ -339,11 +349,7 @@ Microphones with aggressive noise suppression output *exact* digital zero betwee
 
 If `config.json` is missing it is created from the defaults. If it exists but cannot be parsed, WhisperType runs on defaults and **leaves your file alone** — one stray comma must not cost you your settings, so nothing writes over a config it could not read.
 
-Everything except `push_to_talk_key` takes effect on the next dictation — `language` and `input_device` are re-read per job, so the menu-bar submenus change them with no restart at all. The hotkey is read once at startup, so changing it needs (macOS):
-
-```bash
-launchctl kickstart -k gui/$UID/com.whispertype.agent
-```
+Everything except `push_to_talk_key` takes effect on the next dictation — `language` and `input_device` are re-read per job, so the menu submenus change them with no restart at all. The hotkey is read once at startup, so changing it needs **Restart WhisperType** from the menu (on macOS that asks launchd; on Windows a small detached helper waits for the old process to exit before starting the new one, because the single-instance guard will not let two run at once).
 
 ---
 

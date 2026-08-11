@@ -180,6 +180,9 @@ class MacBackend(Backend):
     def target_app(self, target):
         return target.app_name if target else "?"
 
+    def target_bundle(self, target):
+        return (target.bundle_id or "") if target else ""
+
     def activate(self, target):
         if target is None:
             return False

@@ -484,15 +484,30 @@ class App:
             "ts": time.strftime("%H:%M:%S", time.localtime(job.created_at)),
             "dur": f"{job.audio_duration:.1f}s",
             "app": job.app_name or "?",
-            "bundle": getattr(job.target, "bundle_id", "") or "",
+            # Asked of the backend rather than read off the target: only the
+            # backend knows what identifies an application on its platform (a
+            # bundle id, an executable path), and on Windows the target is a
+            # bare integer with no attributes to read at all.
+            "bundle": self._target_bundle(job.target),
             "window": job.window_name,
             "text": "",
         }
         try:
             self.jobs.set_status(job, JobStatus.TRANSCRIBING)
             self.ui.call_soon(self.ui.refresh)
-            self.ui.set_tray_state("transcribing")
 
+            # The idle watchdog releases the model to reclaim memory, and
+            # nothing brought it back: the next dictation after ten quiet
+            # minutes failed with "no model is loaded" and the transcript was
+            # only recoverable from history. Reloading here is safe — this is
+            # the one thread allowed to touch the model — and costs about the
+            # second the release was documented to cost.
+            if not self.engine.loaded:
+                log(f"Model was released while idle — reloading {self.model_name}")
+                self.ui.set_tray_state("loading")
+                self.engine.load(self.model_name)
+
+            self.ui.set_tray_state("transcribing")
             text = self.engine.transcribe(job.audio_bytes, self.cfg.language)
             self._touch()
             log(f"Transcribed (job {job.job_id}, target={job.window_name}): {text}")
@@ -674,13 +689,22 @@ class App:
         except Exception as e:
             log(f"Could not save the benchmark: {e}")
 
+    def _target_bundle(self, target):
+        if target is None:
+            return ""
+        try:
+            return self.backend.target_bundle(target) or ""
+        except Exception as e:
+            log(f"Could not identify the target application: {e}")
+            return ""
+
     def _deliver(self, text, job):
         if job.target is None:
             # No captured target means we do not know where this belongs.
             # Typing into whatever happens to be in front would drop a
             # transcript into an unrelated document.
             self.set_error("No target window was captured — "
-                           "text saved to history (Space)")
+                           "text saved to history")
             return
         try:
             activated = self.backend.activate(job.target)
@@ -690,10 +714,14 @@ class App:
         if not activated:
             self.set_error(
                 f"{job.app_name or 'The target window'} is gone — "
-                f"text saved to history (Space)")
+                f"text saved to history")
             return
         self._suppress_keys = True
         try:
+            # Asked once the window is really in front: on Windows this is
+            # where an elevated target is caught, and SendInput would otherwise
+            # report success while delivering nothing.
+            self.backend.preflight_typing(job.target)
             self.backend.type_text(text)
             if job.send_enter:
                 time.sleep(0.05)
@@ -701,7 +729,7 @@ class App:
                 log(f"Sent Enter after transcription (job {job.job_id})")
             self.clear_error()
         except PermissionError as e:
-            self.set_error(f"{e} — text saved to history (Space)")
+            self.set_error(f"{e} — text saved to history")
         except Exception as e:
             self.set_error(f"Could not type the text ({e}) — saved to history")
         finally:

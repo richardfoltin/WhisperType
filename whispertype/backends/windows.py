@@ -18,16 +18,28 @@ KEYEVENTF_KEYUP = 0x0002
 VK_MENU = 0x12
 VK_RETURN = 0x0D
 
+#: Modifiers that must not be physically held while the transcript is typed.
+#: The push-to-talk key is itself a modifier, so without this a dictation
+#: finished the instant the model was warm turns "a" into Ctrl+A.
+_MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)   # Shift, Ctrl, Alt, L/R Win
+
+#: Stamped into every synthetic event's dwExtraInfo, so a keyboard hook (ours
+#: or anybody's) can tell our typing apart from the user's. The macOS backend
+#: writes the same value into kCGEventSourceUserData.
+EVENT_MARKER = 0x57485459  # 'WHTY'
+
 
 class MOUSEINPUT(ctypes.Structure):
+    # dwExtraInfo is a ULONG_PTR, which is what WPARAM is; declaring it as a
+    # pointer type made it impossible to store the marker value in it.
     _fields_ = [("dx", wt.LONG), ("dy", wt.LONG), ("mouseData", wt.DWORD),
                 ("dwFlags", wt.DWORD), ("time", wt.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+                ("dwExtraInfo", wt.WPARAM)]
 
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
-                ("time", wt.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+                ("time", wt.DWORD), ("dwExtraInfo", wt.WPARAM)]
 
 
 class HARDWAREINPUT(ctypes.Structure):
@@ -42,8 +54,6 @@ class INPUT(ctypes.Structure):
     _anonymous_ = ("_u",)
     _fields_ = [("type", wt.DWORD), ("_u", _INPUT_UNION)]
 
-
-_extra = ctypes.pointer(ctypes.c_ulong(0))
 
 #: One SendInput call per this many characters. A 300 s dictation is tens of
 #: thousands of INPUT structs, and a number of applications drop the tail of a
@@ -66,6 +76,109 @@ def _send_inputs(events):
     return sent
 
 
+# ── Integrity levels ─────────────────────────────────────────────────────────
+#
+# User Interface Privilege Isolation drops synthetic input sent from a lower
+# integrity level to a higher one — SendInput still reports every event as
+# accepted, and the keystrokes simply never arrive. That is the Windows
+# equivalent of macOS's secure-input state: the one case where a transcript can
+# vanish with nothing to show for it. Detect it and keep the text in history.
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x0008
+TokenIntegrityLevel = 25
+
+_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+_advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+_advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+_advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wt.DWORD)
+_advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wt.DWORD]
+_advapi32.OpenProcessToken.restype = wt.BOOL
+_advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD,
+                                       ctypes.POINTER(wt.HANDLE)]
+_advapi32.GetTokenInformation.restype = wt.BOOL
+_advapi32.GetTokenInformation.argtypes = [wt.HANDLE, ctypes.c_int,
+                                          ctypes.c_void_p, wt.DWORD,
+                                          ctypes.POINTER(wt.DWORD)]
+# Without explicit types a HANDLE round-trips through a 32-bit int, which
+# truncates the pseudo handle GetCurrentProcess returns and every real handle
+# above 4 GB — the lookup then fails silently and reports "unknown".
+_kernel32.GetCurrentProcess.restype = wt.HANDLE
+_kernel32.OpenProcess.restype = wt.HANDLE
+_kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+_kernel32.CloseHandle.argtypes = [wt.HANDLE]
+_kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+
+
+#: Distinguishes "not looked up yet" from a lookup that returned None.
+_UNKNOWN = object()
+
+
+class _SID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wt.DWORD)]
+
+
+class _TOKEN_MANDATORY_LABEL(ctypes.Structure):
+    _fields_ = [("Label", _SID_AND_ATTRIBUTES)]
+
+
+def _token_integrity(token):
+    """The RID of a token's integrity level, or None if it cannot be read."""
+    size = wt.DWORD(0)
+    _advapi32.GetTokenInformation(token, TokenIntegrityLevel, None, 0,
+                                  ctypes.byref(size))
+    if not size.value:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if not _advapi32.GetTokenInformation(token, TokenIntegrityLevel, buf,
+                                         size.value, ctypes.byref(size)):
+        return None
+    label = ctypes.cast(buf, ctypes.POINTER(_TOKEN_MANDATORY_LABEL)).contents
+    count = _advapi32.GetSidSubAuthorityCount(label.Label.Sid)
+    if not count:
+        return None
+    # The integrity RID is always the last sub-authority of S-1-16-x.
+    return int(_advapi32.GetSidSubAuthority(label.Label.Sid,
+                                            count.contents.value - 1).contents.value)
+
+
+def _process_integrity(pid=None):
+    """Integrity RID of `pid` (default: this process), or None when unknown.
+
+    None means "could not tell", never "not elevated" — a guess in either
+    direction is worse than staying quiet.
+    """
+    handle = token = None
+    owned = False
+    try:
+        if pid is None:
+            # Pseudo handle — never closed, which is why `owned` gates the
+            # CloseHandle below rather than the handle being truthy.
+            handle = _kernel32.GetCurrentProcess()
+        else:
+            handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                           False, int(pid))
+            owned = True
+            if not handle:
+                return None
+        token = wt.HANDLE()
+        if not _advapi32.OpenProcessToken(handle, TOKEN_QUERY,
+                                          ctypes.byref(token)):
+            return None
+        return _token_integrity(token)
+    except Exception:
+        return None
+    finally:
+        if token:
+            _kernel32.CloseHandle(token)
+        if handle and owned:
+            _kernel32.CloseHandle(handle)
+
+
 class WindowsBackend(Backend):
     name = "windows"
     gpu_label = "GPU"
@@ -73,6 +186,7 @@ class WindowsBackend(Backend):
     def __init__(self):
         self._user32 = ctypes.windll.user32
         self._own_windows = lambda: ()
+        self._integrity = _UNKNOWN
         self._nvml = None
         self._gpu_handle = None
         try:
@@ -121,23 +235,38 @@ class WindowsBackend(Backend):
         title = buf.value.strip()
         return (title[:20] + "…") if len(title) > 20 else (title or "(untitled)")
 
-    def target_app(self, target):
+    def target_pid(self, target):
+        pid = wt.DWORD()
+        self._user32.GetWindowThreadProcessId(target, ctypes.byref(pid))
+        return int(pid.value)
+
+    def _image_path(self, target):
+        """Full path of the executable owning `target`, or "" if unavailable."""
         try:
-            pid = wt.DWORD()
-            self._user32.GetWindowThreadProcessId(target, ctypes.byref(pid))
-            PROCESS_QUERY_LIMITED = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid.value)
-            if h:
-                buf = ctypes.create_unicode_buffer(260)
-                size = wt.DWORD(260)
-                ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
-                ctypes.windll.kernel32.CloseHandle(h)
-                name = buf.value.strip()
-                if name:
-                    return Path(name).stem
+            h = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                      self.target_pid(target))
+            if not h:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(4096)
+                size = wt.DWORD(4096)
+                if not _kernel32.QueryFullProcessImageNameW(
+                        h, 0, buf, ctypes.byref(size)):
+                    return ""
+                return buf.value.strip()
+            finally:
+                _kernel32.CloseHandle(h)
         except Exception:
-            pass
-        return "?"
+            return ""
+
+    def target_app(self, target):
+        path = self._image_path(target)
+        return Path(path).stem if path else "?"
+
+    def target_bundle(self, target):
+        # The executable's path is the Windows analogue of a bundle id: stable
+        # per application, and the thing the icon is read out of.
+        return self._image_path(target) if target is not None else ""
 
     def activate(self, target):
         user32 = self._user32
@@ -176,7 +305,51 @@ class WindowsBackend(Backend):
 
     # ── Input synthesis ──
 
+    def preflight_typing(self, target):
+        """Refuse to type into a window Windows will not deliver keystrokes to.
+
+        UIPI silently drops synthetic input aimed at a process running at a
+        higher integrity level — SendInput reports success and nothing arrives.
+        Without this the transcript disappeared with no error at all, which is
+        the one failure mode the error surface exists to prevent.
+        """
+        if target is None:
+            return
+        try:
+            theirs = _process_integrity(self.target_pid(target))
+        except Exception:
+            return
+        if theirs is None:
+            return
+        ours = self._own_integrity()
+        # Unknown on either side: say nothing. A false alarm here would send
+        # every transcript to history for no reason.
+        if ours is None or theirs <= ours:
+            return
+        raise PermissionError(
+            f"{self.target_app(target)} runs elevated and Windows blocks "
+            f"keystrokes from a normal app into it")
+
+    def _own_integrity(self):
+        if self._integrity is _UNKNOWN:
+            self._integrity = _process_integrity()
+            log(f"Own integrity level: {self._integrity}")
+        return self._integrity
+
+    def _wait_modifiers_released(self, timeout=1.5):
+        """The push-to-talk key is a modifier. Typing while it is still
+        physically held turns the transcript into keyboard shortcuts."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not any(self._user32.GetAsyncKeyState(vk) & 0x8000
+                       for vk in _MODIFIER_VKS):
+                return True
+            time.sleep(0.02)
+        log("Modifiers still held after 1.5s — typing anyway")
+        return False
+
     def type_text(self, text):
+        self._wait_modifiers_released()
         sent = expected = 0
         for start in range(0, len(text), TYPE_CHUNK_CHARS):
             # Iterate UTF-16 code units, not characters: wScan is a WORD, so a
@@ -193,7 +366,7 @@ class WindowsBackend(Backend):
                     inp.ki.wScan = code
                     inp.ki.dwFlags = flags
                     inp.ki.time = 0
-                    inp.ki.dwExtraInfo = _extra
+                    inp.ki.dwExtraInfo = EVENT_MARKER
                     events.append(inp)
             expected += len(events)
             sent += _send_inputs(events)
@@ -212,7 +385,7 @@ class WindowsBackend(Backend):
             inp.ki.wScan = 0
             inp.ki.dwFlags = flags
             inp.ki.time = 0
-            inp.ki.dwExtraInfo = _extra
+            inp.ki.dwExtraInfo = EVENT_MARKER
             events.append(inp)
         _send_inputs(events)
 

@@ -43,6 +43,13 @@ class Backend:
         """Process/application name for the queue table."""
         raise NotImplementedError
 
+    def target_bundle(self, target):
+        """Stable identifier for the target application, used to resolve its
+        icon for the history rows: a bundle id on macOS, the executable's full
+        path on Windows. "" when it cannot be determined — the view then falls
+        back to a monogram plate."""
+        return ""
+
     def activate(self, target):
         """Bring `target` back to the front. Returns True once it is confirmed
         frontmost; False means the transcript should stay in history only."""
@@ -57,6 +64,16 @@ class Backend:
     def send_enter(self):
         """Send a single Return keypress."""
         raise NotImplementedError
+
+    def preflight_typing(self, target):
+        """Raise PermissionError when the transcript cannot possibly reach
+        `target`, so the text is kept in history with a reason instead of being
+        typed into a void.
+
+        Called after the window is confirmed frontmost and before the first
+        keystroke is synthesised. Silence here means "go ahead"; a backend that
+        cannot tell must stay silent rather than guess.
+        """
 
     # ── Metrics ──
 
