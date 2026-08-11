@@ -6,11 +6,24 @@ Everything platform specific goes through `self.backend` (input synthesis,
 window targeting, GPU counter) and `self.ui` (overlay + tray).
 """
 import json
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pynput.keyboard
+
+_IS_MAC = sys.platform == "darwin"
+
+if _IS_MAC:
+    import Quartz
+
+    #: Virtual keycodes, from Carbon's Events.h.
+    _KEY_RETURN, _KEY_KP_ENTER, _KEY_ESCAPE = 0x24, 0x4C, 0x35
+    #: Keys the intercept may swallow, and only while recording. Anything not
+    #: listed here is never touched — a global listener that eats keystrokes is
+    #: far worse than one that misses a shortcut.
+    _SWALLOWED_KEYS = frozenset({_KEY_RETURN, _KEY_KP_ENTER, _KEY_ESCAPE})
 
 from . import __version__, audio, config
 from .jobs import (BenchmarkJob, BenchmarkResult, EngineSwitch, JobQueue,
@@ -102,6 +115,27 @@ class App:
         # and the Enter we send would stop the next recording.
         self._suppress_keys = False
 
+        #: Whether the listener can swallow a key rather than only observe it.
+        #:
+        #: OFF, and this is not a preference. Passing darwin_intercept switches
+        #: pynput's tap from kCGEventTapOptionListenOnly to
+        #: kCGEventTapOptionDefault, which puts our Python callback in the
+        #: critical path of every keystroke on the machine. When such a
+        #: callback overruns the system timeout — and under GIL contention
+        #: during a long dictation it does — macOS posts
+        #: kCGEventTapDisabledByTimeout and disables the tap. pynput calls
+        #: CGEventTapEnable exactly once at startup (_util/darwin.py:234) and
+        #: handles that event nowhere, so the tap stays dead and the hotkey
+        #: silently stops working until the daemon is restarted. Observed:
+        #: recordings at 16:03 and 16:12, then nothing.
+        #:
+        #: The cost of leaving it off is a stray newline in the focused app
+        #: when Enter ends a dictation. That is worth far less than the hotkey.
+        #: Turning it back on requires owning the tap so the disable event can
+        #: be caught and CGEventTapEnable called again — see _intercept.
+        self._can_suppress = False
+        self._swallowed = set()
+
         self.gpu_history = []
         self.gpu_lock = threading.Lock()
 
@@ -127,7 +161,12 @@ class App:
         if self.cfg.idle_unload_seconds > 0:
             self._start_idle_watchdog()
 
-        self._listener = pynput.keyboard.Listener(on_press=self._on_press)
+        listener_kwargs = {"on_press": self._on_press}
+        if self._can_suppress:
+            # Switches the tap from ListenOnly to Default, which is what makes
+            # suppression possible at all.
+            listener_kwargs["darwin_intercept"] = self._intercept
+        self._listener = pynput.keyboard.Listener(**listener_kwargs)
         self._listener.start()
 
         log(f"PTT={self.cfg.ptt_key_name} (double-tap) | Model={self.model_name}")
@@ -899,6 +938,52 @@ class App:
         except Exception as e:
             log(f"Hotkey error: {e}")
 
+    def _intercept(self, event_type, event):
+        """Consume Enter/Escape while recording instead of only observing them.
+
+        pynput's listener is otherwise a ListenOnly tap: it sees a keystroke
+        but the keystroke still reaches whatever is focused. So pressing Enter
+        to finish a dictation also dropped a newline into the document the
+        transcript was about to be typed into. Returning anything other than
+        the event suppresses it system wide.
+
+        This runs on the event tap's thread, so it must be quick and must never
+        raise — a callback that throws or blocks gets the tap disabled by the
+        system, which would kill the hotkey entirely.
+        """
+        try:
+            if self._suppress_keys:
+                return event                    # our own synthetic typing
+            keycode = Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGKeyboardEventKeycode)
+            if keycode not in _SWALLOWED_KEYS:
+                return event
+
+            if event_type == Quartz.kCGEventKeyUp:
+                # Swallow the release of a press we swallowed, so no app ever
+                # sees half a keystroke.
+                if keycode in self._swallowed:
+                    self._swallowed.discard(keycode)
+                    return None
+                return event
+
+            if event_type != Quartz.kCGEventKeyDown or not self.recording:
+                return event
+
+            if keycode == _KEY_ESCAPE:
+                self.stop_recording(discard=True)
+                self.clear_error()
+                self.ui.call_soon(self.ui.hide)
+                log("Recording discarded by Escape")
+            else:
+                self.stop_recording(send_enter=True)
+                log("Recording stopped by Enter (will send Enter after transcription)")
+            self._swallowed.add(keycode)
+            return None
+        except Exception as e:
+            log(f"Key intercept error: {e}")
+            return event                        # never eat a key by accident
+
     def _handle_key(self, key):
         if self._suppress_keys:
             return
@@ -911,14 +996,20 @@ class App:
         # press constantly was being watched globally for the whole time the
         # overlay happened to be up.
 
-        if key == K.esc and self.ui.visible:
+        # While recording, Escape is the intercept's (it has to swallow it).
+        # Outside a recording it only hides the overlay, which is harmless to
+        # let through to whatever the user is doing.
+        if key == K.esc and self.ui.visible and not (self._can_suppress and self.recording):
             if self.recording:
                 self.stop_recording(discard=True)
             self.clear_error()
             self.ui.call_soon(self.ui.hide)
             return
 
-        if key == K.enter and self.recording:
+        # Where the listener can swallow keys, Enter during a recording is
+        # handled in the intercept instead — see _intercept_darwin. Handling it
+        # here as well would stop the recording twice.
+        if key == K.enter and self.recording and not self._can_suppress:
             self.stop_recording(send_enter=True)
             log("Recording stopped by Enter (will send Enter after transcription)")
             return

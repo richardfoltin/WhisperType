@@ -30,7 +30,9 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary, NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel, NSStatusWindowLevel,
 )
-from AppKit import (NSAlert, NSAlertFirstButtonReturn, NSAppearance,
+from AppKit import (NSEvent, NSPopUpMenuWindowLevel,
+                    NSWindowCollectionBehaviorIgnoresCycle,
+                    NSAlert, NSAlertFirstButtonReturn, NSAppearance,
                     NSBitmapImageRep, NSCompositingOperationSourceOver,
                     NSPNGFileType, NSSecureTextField, NSViewHeightSizable,
                     NSViewWidthSizable, NSVisualEffectBlendingModeBehindWindow,
@@ -249,16 +251,23 @@ class AppKitUI:
         rect = NSMakeRect(0, 0, OV_W, self._height)
         panel = OverlayPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             rect, style, NSBackingStoreBuffered, False)
-        panel.setLevel_(NSStatusWindowLevel)
+        # Above a full-screen app's content. NSStatusWindowLevel (25) is not:
+        # a full-screen Space puts its window above it, so the overlay was
+        # invisible whenever you dictated from anything running full screen.
+        panel.setLevel_(NSPopUpMenuWindowLevel)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(True)
         # Panels hide when their app deactivates; ours is never active.
         panel.setHidesOnDeactivate_(False)
+        # CanJoinAllSpaces puts it on every Space including full-screen ones;
+        # FullScreenAuxiliary is what allows it over another app's full-screen
+        # window. Stationary is deliberately gone — it is the "pinned to the
+        # desktop, unaffected by Exposé" behaviour, which fought Space joining.
         panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorStationary
-            | NSWindowCollectionBehaviorFullScreenAuxiliary)
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorIgnoresCycle)
         panel.setAlphaValue_(0.0)
         panel.setReleasedWhenClosed_(False)
 
@@ -359,11 +368,49 @@ class AppKitUI:
 
     # ── Geometry ──
 
-    def _default_origin(self):
-        vf = NSScreen.mainScreen().visibleFrame()
+    def _active_screen(self):
+        """The screen the user is actually working on.
+
+        NSScreen.mainScreen() is the screen holding the key window — and this
+        app never has one, so it can name a display the user is not looking at.
+        The pointer is the honest signal.
+        """
+        try:
+            point = NSEvent.mouseLocation()
+            for screen in NSScreen.screens():
+                frame = screen.frame()
+                if (frame.origin.x <= point.x <= frame.origin.x + frame.size.width
+                        and frame.origin.y <= point.y <= frame.origin.y + frame.size.height):
+                    return screen
+        except Exception:
+            pass
+        return NSScreen.mainScreen()
+
+    def _default_origin(self, screen=None):
+        vf = (screen or self._active_screen()).visibleFrame()
         x = vf.origin.x + (vf.size.width - OV_W) / 2.0
         y = vf.origin.y + vf.size.height - self._height - 20
         return x, y
+
+    def _place(self):
+        """Position the panel for this appearance.
+
+        A dragged position is kept only while it is still on the screen the
+        user is on; otherwise the panel would sit on a display — or beyond an
+        edge — where it cannot be seen, which looks exactly like the app not
+        having started.
+        """
+        screen = self._active_screen()
+        vf = screen.visibleFrame()
+        if self._pos:
+            x, top = self._pos
+            y = top - self._height
+            if (vf.origin.x - 40 <= x <= vf.origin.x + vf.size.width - 40
+                    and vf.origin.y <= y <= vf.origin.y + vf.size.height):
+                self._panel.setFrame_display_(NSMakeRect(x, y, OV_W, self._height), True)
+                return
+        x, y = self._default_origin(screen)
+        self._panel.setFrame_display_(NSMakeRect(x, y, OV_W, self._height), True)
 
     def _set_height(self, h):
         if h == self._height:
@@ -613,9 +660,9 @@ class AppKitUI:
         self._show()
 
     def _show(self):
-        if not self._pos:
-            x, y = self._default_origin()
-            self._panel.setFrame_display_(NSMakeRect(x, y, OV_W, self._height), True)
+        # Re-placed on every appearance, not only the first: the user may be on
+        # a different Space or display than the last time it was shown.
+        self._place()
         # orderFrontRegardless shows the panel without activating the app.
         self._panel.orderFrontRegardless()
         # Fully opaque: the NSVisualEffectView provides the translucency now.

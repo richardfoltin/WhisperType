@@ -1,0 +1,82 @@
+{
+  "permissions": {
+    "deny": [
+      "Write(.git/**)",
+      "Edit(.git/**)",
+      "Write(.env)",
+      "Edit(.env)",
+      "Write(.env.*)",
+      "Edit(.env.*)",
+      "Write(**/*secret*)",
+      "Edit(**/*secret*)",
+      "Write(**/credentials*)",
+      "Edit(**/credentials*)",
+      "Write(.claude/**)",
+      "Edit(.claude/**)",
+      "Write(.env*)",
+      "Edit(.env*)",
+      "Write(**/.env*)",
+      "Edit(**/.env*)",
+      "Write(**/*credential*)",
+      "Edit(**/*credential*)",
+      "Write(.ssh/**)",
+      "Edit(.ssh/**)",
+      "Write(**/.ssh/**)",
+      "Edit(**/.ssh/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-hook.cjs\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.cjs\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/prompt-submit.cjs\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-end.cjs\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/turn-end.cjs\"",
+            "statusMessage": "Kör-lezárás jelzése a hubnak…"
+          }
+        ]
+      }
+    ]
+  }
+}
