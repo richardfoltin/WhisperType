@@ -111,9 +111,24 @@ class App:
         self._suppress_keys = False
 
         #: Whether the listener can swallow a key rather than only observe it.
-        #: macOS gives us darwin_intercept; the Windows build still lets Enter
-        #: through to the focused app, as it always has.
-        self._can_suppress = _IS_MAC
+        #:
+        #: OFF, and this is not a preference. Passing darwin_intercept switches
+        #: pynput's tap from kCGEventTapOptionListenOnly to
+        #: kCGEventTapOptionDefault, which puts our Python callback in the
+        #: critical path of every keystroke on the machine. When such a
+        #: callback overruns the system timeout — and under GIL contention
+        #: during a long dictation it does — macOS posts
+        #: kCGEventTapDisabledByTimeout and disables the tap. pynput calls
+        #: CGEventTapEnable exactly once at startup (_util/darwin.py:234) and
+        #: handles that event nowhere, so the tap stays dead and the hotkey
+        #: silently stops working until the daemon is restarted. Observed:
+        #: recordings at 16:03 and 16:12, then nothing.
+        #:
+        #: The cost of leaving it off is a stray newline in the focused app
+        #: when Enter ends a dictation. That is worth far less than the hotkey.
+        #: Turning it back on requires owning the tap so the disable event can
+        #: be caught and CGEventTapEnable called again — see _intercept.
+        self._can_suppress = False
         self._swallowed = set()
 
         self.gpu_history = []

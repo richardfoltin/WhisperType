@@ -1,6 +1,6 @@
 ---
 name: integrate-annotations
-description: Use when a chat message starts with "[SPEC annotations]" or otherwise lists SPEC margin annotations with ids and intents. Integrates the annotations into the scope's SPEC document and submits a doc revision to the spec-hub server for user approval.
+description: Use when a chat message starts with "[SPEC annotations]" or otherwise lists SPEC margin annotations with ids and intents. Resolves the annotations — code fixes for enforce, chat answers for questions, and a turn summary to the hub's doc-writer for rule changes.
 ---
 
 # Integrate SPEC annotations
@@ -31,45 +31,61 @@ Resolve the scope id once:
 
 ## 2. Handle each annotation by intent
 
-- **rule-change** — the user is changing the spec. Rewrite the anchored
-  rule text according to the note. Collect these ids for the revision.
-- **enforce** — the spec is right, the code is wrong. Do NOT edit the
+- **rule-change** — the user is changing the spec. Do NOT compose
+  document text; instead collect WHAT must change as facts for the
+  brief (see step 3). Collect these ids for the submission.
+- **enforce** — the spec is right, the code is wrong. Do NOT touch the
   document. Fix the code so it complies (stay inside your write scope),
   then mark the annotation resolved:
   `POST {base}/api/scopes/{scopeId}/annotations/{id}/status` with body
   `{"status":"integrated"}`.
 - **question** — answer it in chat. No document edit, no status change;
-  the user resolves the annotation after reading your answer.
+  the user resolves the annotation after reading your answer. When the
+  answer establishes a rule worth recording, add it to the brief as a
+  fact.
 
-## 3. Submit the revision (rule-change ids only)
+## 3. Submit the turn summary (rule-change ids only)
 
-NEVER write the SPEC file with Write/Edit — the file changes only when
-the user approves the revision; a direct edit desyncs the CAS baseline.
+NEVER write the SPEC file with Write/Edit and NEVER compose the full
+document text — the hub's doc-writer writes the prose, and the file
+changes only when the user approves the resulting revision.
 
-Build the FULL updated document text (current content with your
-rule-change edits applied) and submit:
+Build the turn summary: the turn's doc-relevant facts in Hungarian, one per line —
+
+- the exact behavior that changes (what the program does, not how)
+- UI labels verbatim, in quotes
+- error cases and edge cases spelled out
+- only facts you know from the annotations, the chat, or the program's
+  observed behavior — what you cannot know, write as an open question
+  line (`KÉRDÉS: …`); the doc-writer surfaces it instead of guessing
+
+Submit:
 
 ```
-POST {base}/api/doc-revisions
+POST {base}/api/doc-drafts
 {
   "scopeId":      "<scopeId>",
   "docPath":      "<docPath from the header>",
   "baseSha":      "<baseSha from the header>",
-  "proposedText": "<full updated document>",
+  "brief":        "<the turn summary>",
   "sessionId":    "<your claude session id>",
-  "annotationIds": ["<rule-change ids you integrated>"]
+  "annotationIds": ["<rule-change ids you briefed>"]
 }
 ```
 
 On **409** (stale baseSha): `GET {base}/api/scopes/{scopeId}/spec`, take
-the fresh `content` + `sha256`, re-apply your edits, resubmit with the
-new sha as `baseSha`.
+the fresh `sha256`, resubmit with it as `baseSha`.
 
-If the batch contains no rule-change annotation, skip the revision —
-there is nothing to submit.
+The response carries `draft.id`; you may poll
+`GET {base}/api/doc-drafts/{id}` — `done` links the created revision
+(pending the user's approval), `failed` carries the error. Do not wait
+for the approval itself.
+
+If the batch contains no rule-change annotation, skip the brief — there
+is nothing to submit.
 
 ## 4. Report
 
 End your reply with one line per annotation id:
-`<id> → submitted in revision (pending approval)` / `→ code fixed +
-integrated` / `→ answered in chat`.
+`<id> → briefed to the doc-writer (revision pending approval)` /
+`→ code fixed + integrated` / `→ answered in chat`.

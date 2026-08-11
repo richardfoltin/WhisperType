@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// spec-hub scaffold guard-hook v1 (2026-08-06) — installed by spec-hub project registration.
+// spec-hub scaffold guard-hook v3 (2026-08-08) — installed by spec-hub project registration.
 // Managed file: do not edit by hand; upgrades re-apply via POST /api/projects/{id}/scaffold.
 /**
  * spec-hub guard hook — PreToolUse enforcement (spec-hub plan §8.6; ported
@@ -146,17 +146,20 @@ function relIn(repoRoot, absTarget) {
 // ─────────────────────────────────────────────────────────────────────────
 // Shell command classification (Bash + PowerShell tools).
 //
-// The spike proved the shell is an escape route (the model reached for
-// `printf > file` the moment Write was removed), so shell segments are
-// classified fail-closed:
+// RELAXED since v3 (owner decision 2026-08-08): the guard verifies what
+// it can and AUDITS what it cannot, instead of blocking daily work.
 //   - plain read commands (allowlist, no redirection)      → allow
 //   - write commands with extractable targets              → floor+scope check
-//   - interpreters/builders/package managers               → treated as a
-//     write to the TRACKED working directory (must be in scope); inline
-//     code flags (-e/-c/--eval) are denied outright
+//   - interpreters/builders/package managers               → a write to the
+//     TRACKED working directory; out-of-scope dir → allow + audit event
 //   - git: read subcommands allowed; checkout/restore with explicit `--`
-//     pathspecs scope-checked; every other mutating subcommand denied
-//   - anything unrecognized                                → deny
+//     pathspecs scope-checked; every other mutating subcommand DENIED
+//     (git stays the hub's, non-negotiable)
+//   - package-registry commands (publish/login)            → DENIED
+//   - anything unverifiable (unrecognized command, inline
+//     interpreter code, nested shell/eval, find -exec,
+//     substitution in a target)                            → allow + audit
+// The safety floor on extractable targets remains absolute.
 // ─────────────────────────────────────────────────────────────────────────
 
 /** Split on top-level && || ; | and newlines, respecting quotes. */
@@ -471,7 +474,7 @@ function classifyTokens(tokens, dir) {
   if (NESTED_SHELLS.has(cmd)) {
     return {
       targets: [],
-      deny: `nested shell/eval command "${cmd}" cannot be verified`,
+      soft: `nested shell/eval command "${cmd}" not verified`,
     };
   }
 
@@ -483,7 +486,7 @@ function classifyTokens(tokens, dir) {
 
   if (cmd === "find") {
     if (args.some((a) => a === "-delete" || a === "-exec" || a === "-execdir" || a === "-ok")) {
-      return { targets: [], deny: "find with -delete/-exec cannot be verified" };
+      return { targets: [], soft: "find with -delete/-exec not verified" };
     }
     return { targets: [] };
   }
@@ -550,7 +553,7 @@ function classifyTokens(tokens, dir) {
     ) {
       return {
         targets: [],
-        deny: `inline code (${cmd} with -e/-c/-p) cannot be verified`,
+        soft: `inline code (${cmd} with -e/-c/-p) not verified`,
       };
     }
     return { targets: [], dirWrite: true };
@@ -559,7 +562,7 @@ function classifyTokens(tokens, dir) {
   if (WRITE_ALL_ARGS.has(cmd)) {
     const targets = nonFlagArgs(args);
     if (targets.length === 0) {
-      return { targets: [], deny: `write command "${cmd}" with no identifiable target` };
+      return { targets: [], soft: `write command "${cmd}" with no identifiable target` };
     }
     return { targets };
   }
@@ -567,14 +570,14 @@ function classifyTokens(tokens, dir) {
   if (WRITE_LAST_ARG.has(cmd)) {
     const nf = nonFlagArgs(args);
     if (nf.length === 0) {
-      return { targets: [], deny: `write command "${cmd}" with no identifiable target` };
+      return { targets: [], soft: `write command "${cmd}" with no identifiable target` };
     }
     return { targets: [nf[nf.length - 1]] };
   }
 
   return {
     targets: [],
-    deny: `unrecognized command "${cmd}" cannot be verified as read-only`,
+    soft: `unrecognized command "${cmd}" not verified`,
   };
 }
 
@@ -594,7 +597,7 @@ function classifyGit(args) {
     // read-only when there is no positional arg and no destructive flag
     const destructive = subArgs.some((a) => /^-(d|D|m|M|c|C|f)$/.test(a));
     if (!destructive && nonFlagArgs(subArgs).length === 0) return { targets: [] };
-    return { targets: [], deny: `git ${sub} (mutation) is managed by the host's auto-commit system` };
+    return { targets: [], deny: `git ${sub} (mutation) — commits are the developer's job; ask in chat if one is needed` };
   }
   if (sub === "stash") {
     // bare `git stash` PUSHES a stash — only list/show are reads
@@ -619,18 +622,24 @@ function classifyGit(args) {
   }
   return {
     targets: [],
-    deny: `git ${sub || "(bare)"} mutates repo state — git state changes are managed by the host's auto-commit system`,
+    deny: `git ${sub || "(bare)"} mutates repo state — git state changes are the developer's job; ask in chat`,
   };
 }
 
 /**
  * Classify a full shell command. Returns
- *   { targets: string[] (ABSOLUTE), deny?: string }.
+ *   { targets: string[] (ABSOLUTE file writes — scope-ENFORCED),
+ *     dirTargets: string[] (ABSOLUTE working dirs of build/interpreter
+ *     runs — out-of-scope is only AUDITED since v3),
+ *     soft: string[] (unverifiable parts allowed with an audit event),
+ *     deny?: string (policy denial: git mutation, registry command) }.
  * `cwd` is the session working directory from the hook input; `cd` is
  * tracked across segments so relative targets resolve correctly.
  */
 function classifyCommand(command, cwd) {
   const targets = [];
+  const dirTargets = [];
+  const soft = [];
   let dir = cwd;
 
   const queue = splitSegments(command);
@@ -646,28 +655,32 @@ function classifyCommand(command, cwd) {
 
     const { rest, targets: redirTargets } = extractRedirects(outer);
     const cls = classifyTokens(tokenize(rest), dir);
-    if (cls.deny) return { targets: [], deny: cls.deny };
+    if (cls.deny) return { targets: [], dirTargets: [], soft, deny: cls.deny };
+    if (cls.soft) soft.push(cls.soft);
     if (cls.dir !== undefined) dir = cls.dir;
 
     const rawTargets = [...redirTargets, ...cls.targets];
     if (cls.dirWrite) {
       if (dir === null) {
-        return { targets: [], deny: "working directory untrackable after cd — cannot verify write location" };
+        soft.push("working directory untrackable after cd — write location not verified");
+      } else {
+        dirTargets.push(path.resolve(dir));
       }
-      targets.push(path.resolve(dir));
     }
     for (const raw of rawTargets) {
       if (DEV_SINKS.has(raw)) continue;
       if (raw.includes("__SUBST__") || raw.includes("$")) {
-        return { targets: [], deny: `write target "${raw}" contains a substitution and cannot be verified` };
+        soft.push(`write target "${raw}" contains a substitution — not verified`);
+        continue;
       }
       if (dir === null && !path.isAbsolute(raw)) {
-        return { targets: [], deny: "working directory untrackable after cd — cannot verify write location" };
+        soft.push(`write target "${raw}" after an untrackable cd — not verified`);
+        continue;
       }
       targets.push(path.resolve(dir === null ? cwd : dir, raw));
     }
   }
-  return { targets };
+  return { targets, dirTargets, soft };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -808,11 +821,14 @@ function suggestGlob(rel) {
 
 /**
  * Pure-ish decision function (network/cache via ctx). Returns
- *   { action: "allow" } |
+ *   { action: "allow", audit?: string[] } |
  *   { action: "deny", kind, reason, targets, suggestedGlob }
- * EVERY allow is silent: main() emits nothing and exits 0. The hook never
- * emits a PreToolUse "allow" — an explicit allow would bypass the CLI
- * permission system, auto-approving all non-floor writes without a prompt.
+ * EVERY allow is silent toward the CLI: main() emits nothing and exits 0.
+ * The hook never emits a PreToolUse "allow" — an explicit allow would
+ * bypass the CLI permission system, auto-approving all non-floor writes
+ * without a prompt. An allow that carries `audit` lines additionally
+ * fires a best-effort soft-allow event to the hub (v3 relaxation): what
+ * the guard could not verify is allowed but stays visible.
  * The unbound floor-only case is just another silent allow (the floor is
  * still enforced first; the bind-a-scope hint is delivered out-of-band via
  * the SessionStart orientation channel).
@@ -829,6 +845,8 @@ async function decide(input, ctx) {
   const toolInput = input.tool_input || {};
 
   let targets;
+  let dirTargets = [];
+  const audit = [];
   if (WRITE_TOOLS.has(tool)) {
     const p = toolInput.file_path ?? toolInput.notebook_path;
     if (typeof p !== "string" || p.length === 0) {
@@ -844,10 +862,12 @@ async function decide(input, ctx) {
       return deny("shell", `shell command blocked: ${cls.deny}.`, [], null);
     }
     targets = cls.targets;
+    dirTargets = cls.dirTargets;
+    audit.push(...cls.soft);
   }
 
   // 1) Safety floor — FIRST, before any scope lookup, non-overridable.
-  for (const t of targets) {
+  for (const t of [...targets, ...dirTargets]) {
     const rule = floorViolation(t);
     if (rule) {
       return {
@@ -863,12 +883,22 @@ async function decide(input, ctx) {
     }
   }
 
-  // 2) Plain reads never need the scope service.
-  if (targets.length === 0) return { action: "allow" };
+  // 2) Nothing scope-enforceable left → allow (with any audit trail).
+  if (targets.length === 0 && dirTargets.length === 0) {
+    return { action: "allow", audit };
+  }
 
   // 3+4) Scope: server → fresh cache → deny.
   const scope = await resolveScope(input.session_id, ctx);
   if (!scope.ok) {
+    // v3 relaxation: a lookup failure still fail-closes REAL file writes,
+    // but a command whose only footprint is its working directory (build
+    // tools, interpreters) rides through with an audit line — a down hub
+    // must not park every `pnpm test`.
+    if (targets.length === 0) {
+      audit.push(`scope lookup unavailable (${scope.reason}) — dir-write allowed unverified`);
+      return { action: "allow", audit };
+    }
     return deny(
       "unavailable",
       `cannot verify the write scope: ${scope.reason}.`,
@@ -883,7 +913,7 @@ async function decide(input, ctx) {
   // system and auto-approve every non-floor write anywhere on disk. The
   // bind-a-scope hint is delivered via the SessionStart orientation channel.
   if (scope.bound === false) {
-    return { action: "allow" };
+    return { action: "allow", audit };
   }
 
   for (const t of targets) {
@@ -897,6 +927,11 @@ async function decide(input, ctx) {
         scope,
       );
     }
+    // Shared scratch area: the repo-root `.tmp/` is writable for every
+    // bound session regardless of scope. The scaffold gitignores it, so
+    // scratch files stay out of auto-commits and of the codemap — this is
+    // WHERE probe scripts and one-off dumps belong.
+    if (rel === ".tmp" || rel.startsWith(".tmp/")) continue;
     if (!matchesAnyGlob(rel, scope.writeGlobs)) {
       return deny(
         "scope",
@@ -907,7 +942,24 @@ async function decide(input, ctx) {
       );
     }
   }
-  return { action: "allow" };
+
+  // Working-dir writes (build tools, interpreters): in-scope → silent;
+  // outside the repo or the scope → allowed with an audit line (v3 —
+  // enforcing a conventional cwd was blocking `pnpm -r check` style runs
+  // for every subtree session, while a real out-of-scope write already
+  // needs more than a cwd).
+  for (const t of dirTargets) {
+    const rel = relIn(scope.repoPath, t);
+    if (rel === null) {
+      audit.push(`working-dir write outside the repo: ${t}`);
+      continue;
+    }
+    if (rel === ".tmp" || rel.startsWith(".tmp/")) continue;
+    if (!matchesAnyGlob(rel, scope.writeGlobs)) {
+      audit.push(`working-dir write outside the scope: ${rel === "" ? "." : rel}`);
+    }
+  }
+  return { action: "allow", audit };
 
   function deny(kind, detail, denyTargets, suggestedGlob, scopeInfo) {
     const scopeLine = scopeInfo
@@ -951,6 +1003,35 @@ async function reportDenial(input, decision, ctx) {
     );
   } catch {
     /* server down — the deny still stands */
+  }
+}
+
+/** Best-effort audit event for an allow the guard could not verify (v3). */
+async function reportSoftAllow(input, decision, ctx) {
+  try {
+    await httpJson(
+      "POST",
+      `${ctx.baseUrl}/api/events/ingest`,
+      {
+        level: "info",
+        source: "hook",
+        message: `guard soft-allow: ${input.tool_name}`,
+        payload: {
+          claudeSessionId: input.session_id,
+          cwd: input.cwd,
+          toolName: input.tool_name,
+          command:
+            input.tool_input && typeof input.tool_input.command === "string"
+              ? input.tool_input.command.slice(0, 400)
+              : null,
+          audit: decision.audit,
+        },
+      },
+      REPORT_TIMEOUT_MS,
+      ctx.headers,
+    );
+  } catch {
+    /* server down — the allow still stands */
   }
 }
 
@@ -1016,9 +1097,14 @@ async function main() {
   }
 
   if (decision.action === "allow") {
-    // Every allow is silent — bound in-scope AND unbound floor-only. Emitting
-    // an explicit PreToolUse "allow" would bypass the CLI permission system,
-    // auto-approving all non-floor writes without a prompt.
+    // Every allow is silent toward the CLI — bound in-scope AND unbound
+    // floor-only. Emitting an explicit PreToolUse "allow" would bypass the
+    // CLI permission system, auto-approving all non-floor writes without a
+    // prompt. What the guard could not verify still leaves a trace: the
+    // audit lines go to the hub's event log, best-effort.
+    if (input && decision.audit && decision.audit.length > 0) {
+      await reportSoftAllow(input, decision, ctx);
+    }
     process.exit(0);
   }
 

@@ -13,3 +13,4 @@ openai_api_key
 *.key
 .env
 .env.*
+.tmp/
