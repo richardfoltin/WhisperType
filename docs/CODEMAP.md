@@ -12,7 +12,7 @@ that file.
 - setup_mac.py:
   - `APP = ["main.py"]`
   - `OPTIONS = …`
-- files: CLAUDE.md, LICENSE, README.md, SPEC.md, config.template.json, initial_prompt.md, install.bat, install_mac.sh, main.py, requirements-mac.txt, requirements.txt, start.bat, start_debug.bat, start_silent.vbs, uninstall_mac.sh, whispertype.pyw
+- files: CLAUDE.md, FOLDERS.md, LICENSE, README.md, SPEC.md, config.template.json, initial_prompt.md, install.bat, install_mac.sh, main.py, requirements-mac.txt, requirements.txt, start.bat, start_debug.bat, start_silent.vbs, uninstall_mac.sh, whispertype.pyw
 
 ## whispertype
 
