@@ -411,6 +411,19 @@ const GIT_READ_SUBS = new Set([
   "reflog", "fetch", "var", "version", "count-objects",
 ]);
 
+/**
+ * Mutating git subcommands the repo owner unlocked for agent sessions
+ * (2026-09-18): a session may stage, commit and push its own work instead of
+ * handing the command back. Force-push stays denied — it is the one operation
+ * here that destroys published history.
+ *
+ * NOTE: this file is scaffold-managed. A `POST /api/projects/{id}/scaffold`
+ * upgrade re-renders it from the spec-hub template and drops this block; the
+ * durable home for it is
+ * spec-hub/apps/server/src/scaffold/templates/guard-hook.cjs.
+ */
+const GIT_ALLOWED_MUTATIONS = new Set(["add", "commit", "push"]);
+
 /** Shells-in-shells cannot be verified — always denied. */
 const NESTED_SHELLS = new Set([
   "sh", "bash", "zsh", "dash", "ksh", "cmd", "powershell", "pwsh",
@@ -593,6 +606,15 @@ function classifyGit(args) {
   const subArgs = rest.slice(1);
 
   if (GIT_READ_SUBS.has(sub)) return { targets: [] };
+  if (GIT_ALLOWED_MUTATIONS.has(sub)) {
+    if (sub === "push" && subArgs.some((a) => a === "-f" || a === "--force")) {
+      return {
+        targets: [],
+        deny: "git push --force is not unlocked — use --force-with-lease",
+      };
+    }
+    return { targets: [] };
+  }
   if (sub === "branch" || sub === "tag") {
     // read-only when there is no positional arg and no destructive flag
     const destructive = subArgs.some((a) => /^-(d|D|m|M|c|C|f)$/.test(a));
