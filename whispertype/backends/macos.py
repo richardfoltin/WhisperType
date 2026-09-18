@@ -55,15 +55,20 @@ _MODMASK = (Quartz.kCGEventFlagMaskCommand
 class MacTarget:
     """The window/app the transcript should go back to."""
 
-    __slots__ = ("pid", "bundle_id", "app_name", "title", "ax_app", "ax_window")
+    __slots__ = ("pid", "bundle_id", "app_name", "title", "ax_app", "ax_window",
+                 "app")
 
-    def __init__(self, pid, bundle_id, app_name, title, ax_app=None, ax_window=None):
+    def __init__(self, pid, bundle_id, app_name, title, ax_app=None,
+                 ax_window=None, app=None):
         self.pid = pid
         self.bundle_id = bundle_id
         self.app_name = app_name
         self.title = title
         self.ax_app = ax_app
         self.ax_window = ax_window
+        #: The NSRunningApplication we captured. Kept because a pid is not a
+        #: reliable handle back to it — see `_window_list_pid`.
+        self.app = app
 
     def __repr__(self):
         return f"<MacTarget {self.app_name}#{self.pid} {self.title!r}>"
@@ -112,6 +117,9 @@ class MacBackend(Backend):
 
         pid = int(front.processIdentifier())
         app_name = str(front.localizedName() or "?")
+        if pid <= 0:
+            pid = self._window_list_pid(app_name) or pid
+            log(f"capture: {app_name} reports no pid; window list says {pid}")
         bundle_id = str(front.bundleIdentifier() or "")
         ax_app = ax_window = None
         title = ""
@@ -140,18 +148,15 @@ class MacBackend(Backend):
                 log(f"AX window lookup failed: {e}")
 
         return MacTarget(pid, bundle_id, app_name, title or app_name,
-                         ax_app, ax_window)
+                         ax_app, ax_window, app=front)
 
-    def _next_frontmost(self):
-        """The app behind us — the analogue of GetWindow(hwnd, GW_HWNDNEXT).
+    def _front_windows(self):
+        """On-screen app windows, front to back, ours excluded.
 
-        Reached when our own process is frontmost (the user opened the menu-bar
-        menu, or clicked a history button). `runningApplications()` is useless
-        for this: it is ordered by launch time, not z-order, and once we are
-        frontmost no other app reports `isActive()`. `CGWindowListCopyWindowInfo`
-        with kCGWindowListOptionOnScreenOnly *is* a true front-to-back list, so
-        the first layer-0 window that is not ours belongs to the app the user
-        was last working in.
+        `CGWindowListCopyWindowInfo` with kCGWindowListOptionOnScreenOnly is
+        the only true z-ordered list macOS hands out, and it reports the pid
+        that really owns each window. Both things NSWorkspace gets wrong — see
+        the two callers — are answered from here. Yields `(pid, window)`.
         """
         opts = (Quartz.kCGWindowListOptionOnScreenOnly
                 | Quartz.kCGWindowListExcludeDesktopElements)
@@ -166,7 +171,41 @@ class MacBackend(Backend):
                 continue                            # tool/shadow windows
             if float(w.get("kCGWindowAlpha", 1.0)) < 0.05:
                 continue
-            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
+            yield int(pid), w
+
+    def _window_list_pid(self, app_name):
+        """The pid of `app_name`, for an app whose own pid reads as -1.
+
+        `NSRunningApplication.processIdentifier` returns -1 once the process
+        LaunchServices registered is gone while the app itself lives on: a
+        launcher stub that hands its activation token to a second binary and
+        exits leaves exactly that, and the multi-instance Claude copies are
+        built that way. Such an app is still frontmost and still reports
+        `isTerminated() == False`, but -1 poisons everything downstream —
+        `AXUIElementCreateApplication(-1)` fails with kAXErrorInvalidUIElement
+        so no window is ever raised, and the pid lookup in `activate` finds
+        nothing and declares the target gone, sending a finished transcript to
+        the history instead of the window it was dictated into.
+
+        Only an owner-name match counts. Falling back to "whatever window is
+        in front" would be worse than failing: an app with no on-screen window
+        would silently retarget the transcript into an unrelated document.
+        """
+        for pid, w in self._front_windows():
+            if str(w.get("kCGWindowOwnerName") or "") == app_name:
+                return pid
+        return None
+
+    def _next_frontmost(self):
+        """The app behind us — the analogue of GetWindow(hwnd, GW_HWNDNEXT).
+
+        Reached when our own process is frontmost (the user opened the menu-bar
+        menu, or clicked a history button). `runningApplications()` is useless
+        for this: it is ordered by launch time, not z-order, and once we are
+        frontmost no other app reports `isActive()`.
+        """
+        for pid, _w in self._front_windows():
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
             if app is not None and not app.isTerminated():
                 return app
         return None
@@ -186,9 +225,13 @@ class MacBackend(Backend):
     def activate(self, target):
         if target is None:
             return False
-        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(target.pid)
+        # The captured reference first: a pid can go stale (and be reissued to
+        # an unrelated process), and for a pid-less app it never resolved.
+        app = target.app
+        if app is None and target.pid > 0:
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(target.pid)
         if app is None or app.isTerminated():
-            log(f"activate: pid {target.pid} ({target.app_name}) is gone")
+            log(f"activate: {target.app_name} (pid {target.pid}) is gone")
             return False
 
         if app.isHidden():
@@ -222,7 +265,10 @@ class MacBackend(Backend):
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
                 front = ws.frontmostApplication()
-                if front is not None and front.processIdentifier() == target.pid:
+                # By identity, not by pid: NSRunningApplication compares by
+                # activation token, and two pid-less apps both read as -1 —
+                # which would "confirm" the wrong Claude copy.
+                if front is not None and front.isEqual_(app):
                     # Activation reports done before the app is really keyed.
                     time.sleep(0.08)
                     return True
