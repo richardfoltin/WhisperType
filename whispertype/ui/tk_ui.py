@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import threading
+import bisect
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -51,9 +52,49 @@ GPU_GRAPH_H = 56        # added to any of the above when the graph is shown
 MAX_QUEUE_VISIBLE = 5
 HISTORY_ITEM_H = 22     # benchmark rows, which are still a plain table
 
-#: How long the finished transcript takes to run across the stage. The worker
-#: waits 900 ms before hiding the overlay, so this has to stay under it.
-TICKER_SECONDS = 0.7
+#: The stage canvas. The waveform is drawn in the top WAVE_H rows of it,
+#: exactly as it always was; the rows underneath belong to the silence run-up
+#: bar, which used to sit two pixels beneath the loudest peaks.
+#: The stage canvas: the waveform's own height, nothing else on it. 66, not
+#: 52: the panel has the slack, and a waveform needs amplitude to be a
+#: waveform rather than a texture.
+WAVE_H = 66
+
+#: The waveform's scale when nothing better is known: the loudest level the
+#: last recording reached is remembered in the config as "wave_peak", and
+#: only the very first recording on a machine falls back to this.
+WAVE_PEAK_DEFAULT = 4000.0
+
+#: The transcript strip between the stage and the keycaps: one line of Segoe
+#: UI 9 (15 px) with a little air. Packed in every compact state, empty or
+#: not, so text arriving in it moves nothing else on the panel.
+TEXT_ROW_H = 21
+
+#: The strip rolls at the pace the dictation is arriving at — decoded
+#: characters over recording seconds, measured as it goes — so it never
+#: catches up and stops, and never falls further behind. This is the floor
+#: under that measurement, for the first seconds and for slow speakers.
+TRANSCRIPT_CPS_MIN = 8.0
+#: Frames per second of the roll. It moves by the pixel, not the character:
+#: at reading pace a character is seven pixels, and seven-pixel jumps twenty
+#: times a second read as stutter.
+TRANSCRIPT_FPS = 60
+#: A safety, not the rule: the measured pace runs a little under the true
+#: one (the last half-minute is always still being decoded), so over a long
+#: dictation the strip drifts behind. Past this many seconds' worth it rolls
+#: half again as fast until it is back inside.
+TRANSCRIPT_MAX_LAG = 60.0
+#: Once the whole transcript is in, what is still waiting rolls out within
+#: this long and the panel stays up for it — never past TRANSCRIPT_HOLD, so
+#: a strip that somehow never caught up cannot pin the overlay open.
+TRANSCRIPT_FINAL_LAG = 2.0
+TRANSCRIPT_HOLD = 3.0
+
+#: The run-up to the automatic stop appears this many seconds into a pause.
+#: A gap between two words is shorter than this, so it never flashes there;
+#: a real pause shows it almost at once — short and barely warmer than the
+#: line — and it grows and warms from there.
+SILENCE_BAR_DELAY = 0.2
 
 #: Transcript length at which a history row clamps and offers "Show more".
 CLAMP_CHARS = 190
@@ -111,6 +152,11 @@ class _Slider(tk.Canvas):
         # overwriting it breaks every subsequent Tcl call on this canvas.
         self._track_w = width
         self._value = self._snap(value)
+        #: A disabled slider configures a path that is not running. Not
+        #: tk.Canvas's own -state: that only sets the default state of items
+        #: created after it and leaves the bindings live, so the widget would
+        #: look identical and still drag.
+        self._enabled = True
 
         self.bind("<Button-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
@@ -146,16 +192,24 @@ class _Slider(tk.Canvas):
     # ── interaction ──
 
     def _on_press(self, event):
+        if not self._enabled:
+            return
         self.focus_set()
         self._set(self._from_x(event.x), commit=False)
 
     def _on_drag(self, event):
+        if not self._enabled:
+            return
         self._set(self._from_x(event.x), commit=False)
 
     def _on_release(self, _event):
+        if not self._enabled:
+            return
         self.on_change(self._value)
 
     def _nudge(self, direction):
+        if not self._enabled:
+            return
         self._set(self._value + direction * self.step, commit=True)
 
     def _set(self, value, commit):
@@ -174,6 +228,12 @@ class _Slider(tk.Canvas):
         self.marker = marker
         self._redraw()
 
+    def set_enabled(self, on):
+        self._enabled = bool(on)
+        self.configure(cursor="hand2" if self._enabled else "arrow",
+                       takefocus=self._enabled)
+        self._redraw()
+
     def set_palette(self, palette):
         self.C = palette
         self.configure(bg=palette["bar_bg"])
@@ -186,10 +246,15 @@ class _Slider(tk.Canvas):
         self.delete("all")
         y = self.H // 2
         x0, x1, hx = self._x0, self._x1, self._to_x(self._value)
+        on = self._enabled
+        # Everything that carries the value fades; the track stays, so the
+        # control still reads as a slider rather than as a missing widget.
+        accent = C["accent"] if on else theme.mix(C["accent"], C["bar_bg"], 0.6)
+        label = C["text"] if on else C["dim"]
 
         self.create_line(x0, y, x1, y, fill=C["sep"], width=4, capstyle="round")
         if hx > x0 + 1:
-            self.create_line(x0, y, hx, y, fill=C["accent"], width=4,
+            self.create_line(x0, y, hx, y, fill=accent, width=4,
                              capstyle="round")
 
         if self.marker is not None and self.lo <= self.marker <= self.hi:
@@ -197,13 +262,13 @@ class _Slider(tk.Canvas):
             self.create_line(mx, y - 9, mx, y + 9, fill=C["bar_mid"], width=2)
 
         r = 7
-        ring = C["accent"] if self.focus_get() is self else C["text"]
+        ring = accent if (on and self.focus_get() is self) else label
         self.create_oval(hx - r, y - r, hx + r, y + r,
                          fill=C["bg"], outline=ring, width=2)
 
         text = f"{self._value:g}" + (f" {self.unit}" if self.unit else "")
         self.create_text(self._track_w - self.PAD, y, text=text, anchor="e",
-                         fill=C["text"], font=("Segoe UI", 9))
+                         fill=label, font=("Segoe UI", 9))
 
 
 class TkUI:
@@ -284,17 +349,17 @@ class TkUI:
         hdr.bind("<Button-1>", lambda e: setattr(self, "_d", (e.x, e.y)))
         hdr.bind("<B1-Motion>", self._drag)
 
-        # ── Stage: waveform while recording, ticker while transcribing ──
+        # ── Stage: waveform while recording, sweep while transcribing ──
         self.stage = self._themed(tk.Frame(self.root), bg="bg")
-        # 66, not 52: the panel has the slack, and a waveform needs amplitude
-        # to be a waveform rather than a texture.
         self.stage_cv = self._themed(
-            tk.Canvas(self.stage, width=cw, height=66, highlightthickness=0),
+            tk.Canvas(self.stage, width=cw, height=WAVE_H,
+                      highlightthickness=0),
             bg="bg")
         self.stage_cv.pack(padx=14, expand=True)
         # Measured with, not just drawn with — and created once, because every
         # tkfont.Font is a Tcl object that outlives the call that made it.
         self._stage_font = tkfont.Font(family="Segoe UI", size=10)
+        self._text_font = tkfont.Font(family="Segoe UI", size=9)
         self._key_font = tkfont.Font(family="Segoe UI Semibold", size=8)
         self._label_font = tkfont.Font(family="Segoe UI", size=8)
 
@@ -433,6 +498,16 @@ class TkUI:
             tk.Canvas(self.root, width=OV_W, height=28, highlightthickness=0),
             bg="bg")
 
+        # ── Transcript strip, directly above the keycaps ──
+        # A fixed-height frame with propagation off, so the canvas inside can
+        # never ask for more room and push the stage around.
+        self.text_row = self._themed(tk.Frame(self.root, height=TEXT_ROW_H),
+                                     bg="bg")
+        self.text_row.pack_propagate(False)
+        self.text_cv = self._themed(
+            tk.Canvas(self.text_row, highlightthickness=0), bg="bg")
+        self.text_cv.pack(fill="both", expand=True, padx=14)
+
         self._tooltip = None
 
         self.root.geometry(f"{OV_W}x120")
@@ -452,11 +527,23 @@ class TkUI:
         #: Rolling RMS window the waveform scrolls through. Filled on the Tk
         #: thread from the value the audio thread last stored.
         self._wave = [0.0] * (cw // 4)
+        #: Fixed for each recording in show_recording; see _wave_scale.
         self._wave_ceiling = 400.0
+        self._rec_peak = 0.0
         self._silence_since = None
-        self._ticker_text = ""
-        self._ticker_t0 = 0.0
         self._sweep = 0.0
+        #: The transcript as far as it is known — the segments decoded so far
+        #: while recording, the whole of it once the job is done — with the
+        #: pixel offset of every character's start, and how far the strip has
+        #: rolled through it. See _text_tick.
+        self._transcript = ""
+        self._cum = [0]
+        self._scroll = 0.0
+        self._pace = TRANSCRIPT_CPS_MIN     # measured chars/s, see _show_transcript
+        self._text_at = None        # clock of the last roll step
+        self._deadline = None       # when the final transcript must be out
+        self._final_at = None       # when the whole transcript landed
+        self._text_job = None
 
         #: Win32 HWNDs of our own windows, cached as plain ints. Read from the
         #: keyboard thread by the backend's capture_target(), which must not
@@ -634,6 +721,36 @@ class TkUI:
         y = top + 20
         return f"+{x}+{y}"
 
+    def _raise_to_top(self):
+        """Put the panel back into the top-most band, not merely mark it as
+        belonging there.
+
+        ``-topmost`` is set once, at construction, and the style bit does
+        survive — but the Z-order position does not. Windows moves a window
+        into the top-most band on a SetWindowPos and on nothing else, and this
+        panel appears by being moved back from OFF_SCREEN, which is not one.
+        Measured on a live session: the style bit still read top-most while the
+        panel sat fifth of the nine windows covering its own rectangle, under
+        every maximised browser and editor. From the user's side that is
+        indistinguishable from the hotkey doing nothing at all — the recording
+        runs, the panel is drawn, and none of it is ever on screen.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            HWND_TOPMOST = ctypes.c_void_p(-1)
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+            # wm_frame(), not winfo_id(): the band is a property of the wrapper
+            # window Tk puts around a toplevel, and raising the child inside it
+            # moves nothing.
+            hwnd = int(self.root.wm_frame(), 16)
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception as e:
+            log(f"Could not raise the overlay above other windows: {e}")
+
     # ── Layout ──
 
     def _gpu_graph_on(self):
@@ -662,7 +779,8 @@ class TkUI:
     def _repack(self):
         for widget in (self.title_bar, self.status_frame, self.stage,
                        self.gpu_frame, self.message_frame, self.queue_frame,
-                       self.history_frame, self.benchmark_frame, self.hint_cv):
+                       self.history_frame, self.benchmark_frame, self.hint_cv,
+                       self.text_row):
             widget.pack_forget()
 
         mode = self._mode()
@@ -673,6 +791,11 @@ class TkUI:
         # The keycaps used to sit on the window border, close enough that the
         # descenders of "Transcribe" ran into it.
         self.hint_cv.pack(side="bottom", fill="x", pady=(2, 10))
+        if mode not in ("history", "benchmark"):
+            # Directly above the keycaps in every compact state, empty in most
+            # of them — which is the point: the line the transcript will land
+            # on is already there, so its arrival moves nothing.
+            self.text_row.pack(side="bottom", fill="x")
         if mode == "benchmark":
             self.benchmark_frame.pack(side="bottom", fill="x")
         elif mode == "history":
@@ -694,9 +817,10 @@ class TkUI:
         self._update_state_display()
         self._draw_hints()
         # Load-bearing: the stage only redraws itself on a tick, and neither
-        # the waveform nor the ticker ticks outside its own mode — so without
-        # this the last transcript stayed painted across the error panel.
+        # the waveform nor the sweep ticks outside its own mode — so without
+        # this the last drawing stayed painted across the error panel.
         self._draw_stage()
+        self._draw_text()
 
     def _calc_height(self):
         mode = self._mode()
@@ -794,6 +918,7 @@ class TkUI:
         self.root.geometry(f"{OV_W}x{h}{self._get_pos(h)}")
         self.root.update_idletasks()
         self.root.attributes("-alpha", 1.0)
+        self._raise_to_top()
         self.visible = True
         self._refresh_own_hwnds()
         self._start_gpu_refresh()
@@ -807,10 +932,17 @@ class TkUI:
         self.history_mode = False
         self.benchmark_mode = False
         self._message = None
-        self._ticker_text = ""
+        self._reset_transcript()
         self._t0 = time.time()
         self._wave = [0.0] * len(self._wave)
-        self._wave_ceiling = max(self.app.cfg.silence_threshold * 3.0, 400.0)
+        # Fixed for the whole recording, from the loudest moment of the last
+        # one. A scale that moves under the picture is what the user sees as
+        # the waveform shrinking; anything louder than this simply reaches
+        # the top.
+        self._rec_peak = 0.0
+        peak = float(self.app.cfg.get("wave_peak", 0) or WAVE_PEAK_DEFAULT)
+        self._wave_ceiling = max(peak * 1.1,
+                                 self.app.cfg.silence_threshold * 3.0, 400.0)
         self._silence_since = None
         self.target_lbl.config(text=f"→ {target_name}" if target_name else "")
         self._show_overlay()
@@ -824,6 +956,12 @@ class TkUI:
 
     def on_recording_stopped(self):
         self._cancel_timer_blink()
+        # The loudest moment becomes the next recording's scale. Written only
+        # when it moved by a tenth: the scale need not track every syllable,
+        # and a config write per dictation would be noise.
+        known = float(self.app.cfg.get("wave_peak", 0) or 0)
+        if self._rec_peak > 0 and abs(self._rec_peak - known) > known * 0.1:
+            self.app.set_config("wave_peak", round(self._rec_peak))
         # A panel the user deliberately opened must not be pulled away by a
         # job landing behind it.
         if self.history_mode or self.benchmark_mode:
@@ -838,7 +976,8 @@ class TkUI:
 
     def refresh(self):
         if (self.app.recording or self.app.jobs.busy() or self.history_mode
-                or self.benchmark_mode or self.app.last_error or self._message):
+                or self.benchmark_mode or self.app.last_error or self._message
+                or self._holding()):
             if not self.app.recording:
                 self._show_rec_idle()
             if self.benchmark_mode:
@@ -852,6 +991,11 @@ class TkUI:
             self.hide()
 
     def check_hide(self):
+        if self._holding():
+            # The strip is still rolling the last of the transcript out; come
+            # back when it has, rather than pulling it away mid-sentence.
+            self.root.after(200, self.check_hide)
+            return
         # An unacknowledged error keeps the overlay up — it is the only place
         # the reason is written down.
         if (not self.app.jobs.busy() and not self.app.recording
@@ -874,14 +1018,140 @@ class TkUI:
         self.root.after(0, run)
 
     def set_ticker(self, text):
-        """Run the finished transcript across the stage before it is typed, so
-        there is a moment where you can see what is about to land in your
-        document."""
-        def run():
-            self._ticker_text = text or ""
-            self._ticker_t0 = time.time()
-            self._stage_tick()
-        self.root.after(0, run)
+        """The whole transcript is in. It rolls out into the strip, and the
+        panel stays up until it has (see _holding).
+
+        Kept under this name because the core and the macOS panel share the
+        call; there the text still runs across the stage. Here the stage is
+        the microphone's, and the words have a line of their own.
+        """
+        self.root.after(0, lambda: self._show_transcript(text, final=True))
+
+    def set_partial(self, text, done, total):
+        """The dictation so far, decoded while it is still being spoken.
+
+        Reached through call_soon, so this already runs on the Tk thread. The
+        segment count is deliberately not shown: how many pieces the decoder
+        cut a dictation into answers a question nobody asked.
+        """
+        self._show_transcript(text, final=False)
+
+    def _show_transcript(self, text, final):
+        text = text or ""
+        # Segments only ever extend what was there, and the final transcript
+        # is the same words joined — so what has rolled out stays rolled out
+        # and only the tail is measured. Anything else starts the strip over.
+        if text.startswith(self._transcript):
+            new = text[len(self._transcript):]
+        else:
+            new = text
+            self._cum = [0]
+            self._scroll = 0.0
+        f, cum = self._text_font, self._cum
+        for ch in new:
+            cum.append(cum[-1] + f.measure(ch))
+        self._transcript = text
+        now = time.time()
+        if final:
+            self._final_at = now
+            # A fixed deadline, not a moving one: a rate recomputed each step
+            # from what is left only ever approaches the end, and the last
+            # words would still be waiting when the hold ran out.
+            self._deadline = now + TRANSCRIPT_FINAL_LAG
+        elif self.app.recording:
+            # The dictation's own pace: what has been decoded, over how long
+            # the microphone has been open. It runs a touch low — the newest
+            # half-minute is always still in the decoder — which is the safe
+            # direction: the strip trails, and never runs dry and stops.
+            elapsed = max(now - self._t0, 1.0)
+            self._pace = max(TRANSCRIPT_CPS_MIN, len(text) / elapsed)
+        if self._text_job is None:
+            self._text_at = now
+            self._text_tick()
+
+    def _reset_transcript(self):
+        if self._text_job is not None:
+            self.root.after_cancel(self._text_job)
+            self._text_job = None
+        self._transcript = ""
+        self._cum = [0]
+        self._scroll = 0.0
+        self._pace = TRANSCRIPT_CPS_MIN
+        self._text_at = None
+        self._deadline = None
+        self._final_at = None
+        self._draw_text()
+
+    def _text_tick(self):
+        """Roll the strip forward, by the pixel, at the dictation's pace.
+
+        The final transcript is the one place it goes faster: whatever is
+        left has to be out by the deadline, so the rate is whichever is
+        higher. The floor on the remaining time makes the last step snap
+        rather than crawl.
+        """
+        self._text_job = None
+        now = time.time()
+        dt = now - (self._text_at or now)
+        self._text_at = now
+        total = self._cum[-1]
+        pending = total - self._scroll
+        if pending > 0:
+            avg = total / max(len(self._transcript), 1)
+            rate = self._pace * avg                  # px/s at dictation pace
+            if self._final_at is not None:
+                remaining = max((self._deadline or now) - now, 0.05)
+                rate = max(rate, pending / remaining)
+            elif pending > TRANSCRIPT_MAX_LAG * rate:
+                rate *= 1.5
+            self._scroll = min(total, self._scroll + rate * dt)
+            self._draw_text()
+        # Not gated on visibility: hide() resets the transcript and cancels
+        # this job, so a strip with something left to roll is one that will
+        # be, or is about to be, on screen.
+        if self._scroll < total:
+            self._text_job = self.root.after(1000 // TRANSCRIPT_FPS,
+                                             self._text_tick)
+
+    def _holding(self):
+        """True while the panel should stay up for the strip to finish.
+
+        Only after the final transcript, and never past TRANSCRIPT_HOLD.
+        """
+        if self._final_at is None:
+            return False
+        return (self._scroll < self._cum[-1]
+                and time.time() - self._final_at < TRANSCRIPT_HOLD)
+
+    def _draw_text(self):
+        """The strip's window onto the transcript: the last `width` pixels of
+        what has rolled out, flush to both edges.
+
+        Drawn from the character that starts at or before the left edge to
+        the one that starts at or before the roll's front, left-anchored at
+        its true pixel offset; the canvas clips the rest on both sides. That
+        is what makes the roll continuous — the text slides, and the next
+        character simply comes into view at the right.
+        """
+        c = self.text_cv
+        try:
+            c.delete("all")
+        except tk.TclError:
+            return
+        cum = self._cum
+        scroll = min(self._scroll, cum[-1])
+        if not self._transcript or scroll <= 0:
+            return
+        width = c.winfo_width()
+        if width < 10:                  # not mapped yet: what it will be
+            width = OV_W - 28
+        first = max(0, bisect.bisect_right(cum, scroll - width) - 1)
+        last = bisect.bisect_left(cum, scroll)
+        if last <= first:
+            return
+        c.create_text(width - (scroll - cum[first]), TEXT_ROW_H // 2,
+                      text=self._transcript[first:last], anchor="w",
+                      fill=self.C["text"], font=self._text_font)
 
     def show_loading(self, model_name):
         self.root.after(0, lambda: (setattr(self, "_message",
@@ -913,6 +1183,7 @@ class TkUI:
         # so the backend must be able to recognise it as ours.
         self._refresh_own_hwnds()
         self.root.attributes("-alpha", 1.0)
+        self._raise_to_top()
         self.visible = True
 
     def hide(self):
@@ -921,11 +1192,12 @@ class TkUI:
         self._hide_tooltip()
         for widget in (self.title_bar, self.status_frame, self.stage,
                        self.gpu_frame, self.message_frame, self.queue_frame,
-                       self.history_frame, self.benchmark_frame, self.hint_cv):
+                       self.history_frame, self.benchmark_frame, self.hint_cv,
+                       self.text_row):
             widget.pack_forget()
         self.history_mode = False
         self.benchmark_mode = False
-        self._ticker_text = ""
+        self._reset_transcript()
         self.root.attributes("-alpha", 0.0)
         self.root.geometry(OFF_SCREEN)
         self.visible = False
@@ -934,6 +1206,7 @@ class TkUI:
         """Called from the audio thread ~16x/s. Store only — Tcl is not
         thread-safe, so _level_tick() does the redraw on the main loop."""
         self._level = rms
+        self._rec_peak = max(self._rec_peak, rms)
         # Tracked here rather than in the recorder so the overlay can show how
         # far into the auto-stop a pause has run without the core growing a
         # UI-shaped callback.
@@ -951,8 +1224,8 @@ class TkUI:
         self._level_job = self.root.after(60, self._level_tick)
 
     def _stage_tick(self):
-        """Animation for the transcribing stage — the reveal, or the sweep that
-        stands in for it until Whisper returns anything at all."""
+        """Animation for the transcribing stage: the sweep that says the
+        decoder is working. The words themselves go to the strip."""
         if self._ticker_job:
             self.root.after_cancel(self._ticker_job)
             self._ticker_job = None
@@ -962,10 +1235,7 @@ class TkUI:
             return                  # nothing to animate; do not spin forever
         self._sweep = (self._sweep + 0.02) % 1.0
         self._draw_stage()
-        done = (self._ticker_text
-                and time.time() - self._ticker_t0 > TICKER_SECONDS)
-        if not done:
-            self._ticker_job = self.root.after(40, self._stage_tick)
+        self._ticker_job = self.root.after(40, self._stage_tick)
 
     def _draw_stage(self):
         c = self.stage_cv
@@ -978,26 +1248,23 @@ class TkUI:
         if mode == "recording":
             self._draw_waveform(c, W, H)
         elif mode == "transcribing":
-            self._draw_ticker(c, W, H)
+            self._draw_sweep(c, W, H)
 
     def _wave_scale(self):
         """(floor, ceiling) the waveform is drawn between.
 
-        Auto-ranging, because a fixed ceiling of 4000 is wrong for every
-        microphone that is not the one it was picked for: a webcam mic across
-        the desk peaks around 1300, which drew speech as a few pixels of dirt
-        on the centre line. The floor is the silence threshold, so a pause is
-        genuinely flat rather than a low hum — that is the thing worth seeing.
+        The floor is the silence threshold, so a pause is genuinely flat
+        rather than a low hum — that is the thing worth seeing.
 
-        The ceiling attacks instantly and releases slowly, so one loud syllable
-        does not permanently shrink everything after it.
+        The ceiling is fixed for the whole recording (see show_recording). It
+        used to auto-range — attack on a loud syllable, release slowly —
+        because a fixed 4000 was wrong for every microphone but the one it
+        was picked for. But every attack re-normalised every bar already on
+        screen, so the whole picture shrank and then breathed back, and a
+        waveform that changes size for reasons you cannot see is worse than
+        one that clips.
         """
         floor = self.app.cfg.silence_threshold
-        target = max(max(self._wave, default=0.0) * 1.1, floor * 3.0, 400.0)
-        if target > self._wave_ceiling:
-            self._wave_ceiling = target
-        else:
-            self._wave_ceiling += (target - self._wave_ceiling) * 0.05
         return floor, max(self._wave_ceiling, floor + 1.0)
 
     def _draw_waveform(self, c, W, H):
@@ -1012,7 +1279,31 @@ class TkUI:
         span = ceiling - floor
         room = H / 2 - 3
 
-        c.create_line(0, mid, W, mid, fill=C["sep"])
+        # Bottom to top: the baseline, the run-up fill on it, then the bars.
+        # The waveform is always the top layer — under speech the fill shows
+        # only through the gaps between bars, and comes fully into view
+        # exactly where the pause is.
+        c.create_line(0, mid, W, mid, fill=C["sep"], tags="baseline")
+
+        # The run-up to the automatic stop, on the baseline itself. It starts
+        # SILENCE_BAR_DELAY into a pause, short and barely warmer than the
+        # line, and grows rightward while its colour runs sep → trans → rec
+        # in one continuous blend: there is no moment at which it switches
+        # on. Without it a recording that ends itself mid-thought looks like
+        # a crash; as a bar of its own it was one more thing under the
+        # waveform, and this line was already there.
+        hold = self.app.cfg.silence_duration
+        if hold > 0 and self._silence_since is not None:
+            paused = time.monotonic() - self._silence_since
+            frac = min(paused / hold, 1.0)
+            if paused >= SILENCE_BAR_DELAY:
+                if frac < 0.6:
+                    colour = theme.mix(C["sep"], C["trans"], frac / 0.6)
+                else:
+                    colour = theme.mix(C["trans"], C["rec"], (frac - 0.6) / 0.4)
+                c.create_line(0, mid, W * frac, mid, width=2, fill=colour,
+                              tags="runup")
+
         for i, rms in enumerate(self._wave):
             norm = (rms - floor) / span
             if norm <= 0:
@@ -1027,7 +1318,7 @@ class TkUI:
             colour = C["accent"] if i > bars * 0.55 else theme.mix(
                 C["accent"], C["bg"], 0.45)
             c.create_line(x, mid - amp, x, mid + amp, fill=colour,
-                          width=max(1, int(step) - 1))
+                          width=max(1, int(step) - 1), tags="bar")
 
         # No threshold tick: at a typical threshold of 200 against a 4000
         # ceiling it lands a single pixel off the centre line, where it reads
@@ -1035,46 +1326,17 @@ class TkUI:
         # threshold against the measured noise floor, which is where that
         # comparison actually helps.
 
-        hold = self.app.cfg.silence_duration
-        if hold > 0 and self._silence_since is not None:
-            # The run-up to the automatic stop. Without it a recording that
-            # ends itself mid-thought looks like a crash.
-            frac = min((time.monotonic() - self._silence_since) / hold, 1.0)
-            c.create_line(0, H - 1, W, H - 1, fill=C["sep"])
-            c.create_line(0, H - 1, W * frac, H - 1,
-                          fill=C["trans"] if frac < 0.75 else C["rec"], width=2)
-
-    def _draw_ticker(self, c, W, H):
+    def _draw_sweep(self, c, W, H):
+        """A sweeping hairline: "working", without pretending to know how far
+        along it is. The transcript no longer runs across the stage — it has
+        the strip under this row, in both modes."""
         C = self.C
         y = H // 2
-        if not self._ticker_text:
-            # Nothing to show yet: a sweeping hairline, which says "working"
-            # without pretending to know how far along it is.
-            span = W * 0.28
-            x = -span + (W + span) * self._sweep
-            c.create_line(0, y, W, y, fill=C["sep"])
-            c.create_line(max(0, x), y, min(W, x + span), y,
-                          fill=C["accent"], width=2)
-            return
-
-        frac = min((time.time() - self._ticker_t0) / TICKER_SECONDS, 1.0)
-        shown = self._ticker_text[:max(1, int(len(self._ticker_text) * frac))]
-        right = W - 10
-        # Anchored to the right and allowed to overflow off the left edge: the
-        # end of the sentence — the part still arriving — is always readable.
-        c.create_text(right, y, text=shown, anchor="e", fill=C["text"],
-                      font=self._stage_font)
-        if frac < 1.0:
-            caret_x = right + 3
-            c.create_line(caret_x, y - 8, caret_x, y + 8, fill=C["accent"],
-                          width=2)
-        if self._stage_font.measure(shown) > W - 16:
-            # Dithered plates instead of a gradient: Tk canvas items are
-            # opaque, but a stippled fill covers a fraction of the pixels, and
-            # four of them stepping down reads as a fade at this size.
-            for i, stipple in enumerate(("gray75", "gray50", "gray25", "gray12")):
-                c.create_rectangle(i * 7, 0, (i + 1) * 7, H, outline="",
-                                   fill=C["bg"], stipple=stipple)
+        span = W * 0.28
+        x = -span + (W + span) * self._sweep
+        c.create_line(0, y, W, y, fill=C["sep"])
+        c.create_line(max(0, x), y, min(W, x + span), y,
+                      fill=C["accent"], width=2)
 
     # ── Footer: keycap hints ──
 
@@ -1720,6 +1982,14 @@ class TkUI:
             pystray.MenuItem("Microphone", microphones),
             pystray.MenuItem("Release model when idle", idle),
             pystray.MenuItem(
+                "Release GPU now",
+                lambda icon, item: app.release_gpu("tray"),
+                # Only for the local engine, and only when there is something
+                # to hand back — an item that does nothing is worse than none.
+                visible=lambda item: local,
+                enabled=lambda item: app.engine.loaded and not app.model_switching,
+            ),
+            pystray.MenuItem(
                 "Download all models",
                 lambda icon, item: app.download_all_models(),
                 # Nothing to download when the models live on OpenAI's servers.
@@ -2055,6 +2325,36 @@ class TkUI:
             lambda v: app.set_language(v.rsplit("(", 1)[1].rstrip(")")))
         row(sec, 4, "Language", lang_box)
 
+        stream_var = tk.BooleanVar(value=app.cfg.stream_transcription)
+        stream_check = self._themed(
+            tk.Checkbutton(sec, text="Transcribe while I speak",
+                           variable=stream_var, highlightthickness=0, bd=0,
+                           font=("Segoe UI", 9),
+                           command=lambda: self._pick_streaming(stream_var.get())),
+            bg="bg", fg="text", selectcolor="bar_bg", activebackground="bg",
+            activeforeground="text")
+        # Two lines: row() fixes the height of every hint so that the ones
+        # which change at runtime cannot make the window jump a row taller.
+        row(sec, 6, "Streaming", stream_check,
+            "Decoding starts at the first pause, so a long dictation is "
+            "nearly finished by the time you let go.")
+
+        # 30 s is the floor, not 0: below one full Whisper window a segment is
+        # mostly the decoder's own silence padding, which is where it invents
+        # stock phrases. A control that lets you make the transcript worse is
+        # not a preference. The top widens to a hand-edited value instead of
+        # clamping it, exactly as the silence threshold above does.
+        seg_now = app.cfg.segment_min_seconds
+        seg_box, seg_slider = self._settings_slider(
+            sec, lo=30, hi=max(90, int((seg_now + 4) // 5) * 5), step=5,
+            value=seg_now, unit="s",
+            on_change=lambda v: app.set_config("segment_min_seconds", v))
+        row(sec, 8, "Segment length", seg_box,
+            "The least audio a piece may hold before it is cut off at a "
+            "pause. Longer pieces mean fewer, larger decodes.")
+        self._set["seg_slider"] = seg_slider
+        self._sync_streaming(app.cfg.stream_transcription)
+
         # ══ Audio ══
         sec = section("Audio")
 
@@ -2198,6 +2498,18 @@ class TkUI:
     def _pick_theme(self, name):
         self.app.set_config("theme", name)
         self.set_theme(name)
+
+    def _pick_streaming(self, on):
+        self.app.set_config("stream_transcription", bool(on))
+        self._sync_streaming(on)
+
+    def _sync_streaming(self, on):
+        """Grey the segment slider out when streaming is off — it configures a
+        path that is not running, the same way the GPU checkbox disables itself
+        on a machine with no GPU."""
+        slider = self._set.get("seg_slider")
+        if slider is not None:
+            slider.set_enabled(on)
 
     def _pick_gpu_graph(self, on):
         self.app.set_config("show_gpu_graph", bool(on))

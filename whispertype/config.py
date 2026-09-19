@@ -37,10 +37,32 @@ DEFAULTS = {
     #: Release the model after this many idle minutes (0 disables). Reloading
     #: from the local cache measures about a second.
     "idle_unload_minutes": 10,
+    #: Run the CUDA decoder in a process of its own, so a native fault in the
+    #: NVIDIA driver kills only the decoder and the clip is retried instead of
+    #: lost. Set false to decode in-process (debugging, or an environment where
+    #: the child cannot be spawned). Ignored on macOS.
+    "isolate_decoder": True,
+    #: Hand the GPU back while something is running full screen, whatever
+    #: idle_unload_minutes says. A resident model is invisible until the
+    #: machine needs that memory for something else — on an 8 GB card, 1.8 GB
+    #: is the difference between a game fitting in VRAM and stuttering.
+    "release_gpu_for_fullscreen": True,
     #: A clip whose level never stayed above silence_threshold for this long is
     #: discarded rather than transcribed — otherwise Whisper invents a sentence
     #: for silence and types it wherever the user is working.
     "min_speech_seconds": 0.25,
+    #: Decode a dictation while it is still being recorded, in pieces cut at
+    #: pauses. Off restores the single-job path exactly.
+    "stream_transcription": True,
+    #: No cut before this much audio: Whisper pads every call out to 30
+    #: seconds, and a segment mostly made of padding is where it hallucinates.
+    "segment_min_seconds": 30.0,
+    #: How long to wait for a usable pause before cutting at the quietest
+    #: point seen instead.
+    "segment_max_seconds": 120.0,
+    #: How long the level must stay below silence_threshold for the gap to
+    #: count as a cut point.
+    "segment_cut_silence": 0.5,
     #: "auto" follows the system appearance; "dark" / "light" pin it.
     "theme": "auto",
     #: The GPU sparkline is developer telemetry sitting above "am I
@@ -55,6 +77,10 @@ DEFAULTS = {
     #: Leave null and put the key in ~/.whispertype/openai_api_key (or the
     #: OPENAI_API_KEY environment variable) instead — see the api_key property.
     "openai_api_key": None,
+    #: The loudest level the last recording reached. The overlay scales its
+    #: waveform to it for the whole of the next recording, so the picture
+    #: never changes size mid-sentence. Written by the overlay itself.
+    "wave_peak": 4000,
 }
 
 
@@ -149,6 +175,33 @@ class Config:
                                            DEFAULTS["min_speech_seconds"])))
         except (TypeError, ValueError):
             return DEFAULTS["min_speech_seconds"]
+
+    @property
+    def stream_transcription(self):
+        return bool(self.get("stream_transcription",
+                             DEFAULTS["stream_transcription"]))
+
+    @property
+    def segment_min_seconds(self):
+        # Floored at 1 s only, not at the 30 s the settings slider enforces.
+        # This file is hand-editable on purpose and the rest of it trusts what
+        # it finds — silence_threshold is read the same way, and the slider
+        # widens to a hand-set value rather than clamping it. The 30 s reason
+        # is written above the default in DEFAULTS, where someone editing this
+        # key will read it.
+        return max(1.0, float(self.get("segment_min_seconds",
+                                       DEFAULTS["segment_min_seconds"])))
+
+    @property
+    def segment_max_seconds(self):
+        return max(self.segment_min_seconds,
+                   float(self.get("segment_max_seconds",
+                                  DEFAULTS["segment_max_seconds"])))
+
+    @property
+    def segment_cut_silence(self):
+        return max(0.1, float(self.get("segment_cut_silence",
+                                       DEFAULTS["segment_cut_silence"])))
 
     # ── OpenAI API mode ──
 

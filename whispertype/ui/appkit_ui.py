@@ -504,6 +504,11 @@ class AppKitUI:
             height = OV_H_COMPACT
         self._set_height(height)
 
+    def set_partial(self, text, done, total):
+        """Segment progress. The macOS overlay has no line to put it on yet, so
+        this is deliberately a no-op rather than an AttributeError — the
+        streaming path is shared, only its display is not."""
+
     def set_ticker(self, text):
         """Show the finished transcript running in from the right."""
         self.call_soon(lambda: self._js(f"wt.setTicker({_json(text or '')});"))

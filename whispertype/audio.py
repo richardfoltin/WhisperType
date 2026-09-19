@@ -221,6 +221,169 @@ def list_input_devices():
         return list(out)
 
 
+#: Whisper decodes in windows of this many seconds, padding the last one out
+#: with silence to fill it.
+WINDOW_SECONDS = 30.0
+
+#: A last window holding less than this much real audio is mostly padding, and
+#: padding is what Whisper answers with an invented stock phrase. Measured on
+#: three real dictations: every segment that ended 0.1-1.3 s past a window
+#: boundary came back with a "Köszönöm" or a garbled half-word on the end,
+#: while none that ended more than 5 s past one did.
+MIN_WINDOW_TAIL = 5.0
+
+
+class SegmentCutter:
+    """Decides where a recording may be split into separately-decodable pieces.
+
+    Fed the (chunk, rms) pair the capture loop already computes, and answers
+    one question: close the segment here, or keep going. It holds no state
+    beyond the segment it is accumulating, touches neither PortAudio nor
+    Whisper, and is therefore testable from a synthetic level sequence.
+
+    The rule is a floor, a pause and a ceiling.
+
+    The FLOOR exists because Whisper pads every call out to 30 seconds, and a
+    segment that is mostly padding is exactly where it invents a stock phrase.
+    No cut may leave one behind.
+
+    The PAUSE exists because the only thing splitting audio can genuinely
+    break is a word cut in half. There is no textual context to lose:
+    DECODE_OPTIONS sets condition_on_previous_text=False, so Whisper already
+    decodes each 30-second window independently.
+
+    The CEILING exists so that speech with no usable pause in it is still cut
+    eventually — but even then at the quietest chunk seen since the floor,
+    never at an arbitrary offset.
+
+    On top of those three, no cut may leave a SLIVER. Whisper pads its last
+    window out to 30 seconds, so a segment of 30.7 s is decoded as one full
+    window plus a second one holding 0.7 s of speech and 29.3 s of silence —
+    and it answers that second call with a stock phrase it made up. The floor
+    stops a whole segment being mostly padding; this stops a segment's tail
+    being mostly padding, which is the same failure one level down.
+    """
+
+    def __init__(self, rate, chunk, *, threshold, min_seconds, max_seconds,
+                 cut_silence, window_seconds=WINDOW_SECONDS,
+                 min_window_tail=MIN_WINDOW_TAIL):
+        self._chunk_seconds = chunk / float(rate)
+        self._threshold = threshold
+        # Taken as arguments rather than read off the module so a probe can
+        # scale the whole rule down to numbers a person can check by hand.
+        self._window = window_seconds
+        self._min_tail = min_window_tail
+        self._min_chunks = max(1, int(min_seconds / self._chunk_seconds))
+        self._max_chunks = max(self._min_chunks,
+                               int(max_seconds / self._chunk_seconds))
+        self._silence_chunks = max(1, int(cut_silence / self._chunk_seconds))
+        #: Survives _reset: once a recording has been cut, its tail is a tail
+        #: rather than a whole clip, and flush() treats the two differently.
+        self._cut_made = False
+        self._reset()
+
+    def _reset(self):
+        self._frames = []
+        self._speech = False
+        self._silence_run = 0
+        self._best_rms = None
+        self._best_idx = None
+
+    def feed(self, data, rms):
+        """Take one captured chunk. Returns a closed segment, or None."""
+        self._frames.append(data)
+        if rms >= self._threshold:
+            self._speech = True
+            self._silence_run = 0
+        else:
+            self._silence_run += 1
+
+        n = len(self._frames)
+        # Nothing may be cut before the floor, and no candidate from before it
+        # is worth remembering: cutting there could only produce a segment
+        # shorter than the floor, which is the case the floor exists to stop.
+        if n < self._min_chunks or not self._speech:
+            return None
+
+        if self._best_rms is None or rms < self._best_rms:
+            self._best_rms, self._best_idx = rms, n
+
+        if self._silence_run >= self._silence_chunks:
+            if self._sliver(n):
+                # Wait rather than cut. Almost always this is a few hundred
+                # milliseconds further into the same pause, which is still a
+                # genuine pause; a short pause is skipped for the next one.
+                return None
+            return self._close(n)
+        if n >= self._max_chunks:
+            return self._close(self._safe_ceiling())
+        return None
+
+    def _sliver(self, chunks):
+        """Would cutting here leave a last decode window that is mostly
+        padding?"""
+        tail = (chunks * self._chunk_seconds) % self._window
+        return 0 < tail < self._min_tail
+
+    def _safe_ceiling(self):
+        """Where to cut when the ceiling is reached and no pause was usable.
+
+        Normally the quietest chunk seen. When that would leave a sliver there
+        is no quieter option left to look for, so the cut falls back to a whole
+        number of decode windows — an arbitrary offset, but one the decoder
+        handles as a full window rather than as padding.
+        """
+        upto = self._best_idx
+        if not self._sliver(upto):
+            return upto
+        windows = int(upto * self._chunk_seconds // self._window)
+        # Rounded, not truncated: a whole number of windows divided by a chunk
+        # length that is not exact in binary lands a hair under the boundary,
+        # and truncating there would move the cut a chunk earlier every time.
+        boundary = round(windows * self._window / self._chunk_seconds)
+        return max(self._min_chunks, min(upto, boundary))
+
+    def _close(self, upto):
+        """Cut at `upto` chunks and carry the remainder into the next segment."""
+        segment = b"".join(self._frames[:upto])
+        rest = self._frames[upto:]
+        self._reset()
+        self._cut_made = True
+        self._frames = rest
+        # `rest` may well contain speech, but it has not been measured under
+        # the new segment's accounting — leaving _speech False just means the
+        # next segment has to earn its own cut, which is the safe direction.
+        return segment
+
+    def flush(self):
+        """Whatever is left when capture ends, or None.
+
+        None when there is nothing left, and also when a cut has already been
+        made and what remains never rose above the threshold: that tail is
+        pure silence, and a silence-only call is precisely what Whisper
+        answers with an invented stock phrase.
+
+        When no cut was ever made this is the entire recording, and it is
+        returned whatever it contains — min_speech_seconds owns that decision,
+        and has owned it since long before this class existed.
+
+        The sliver rule does not apply here and cannot: capture has ended, so
+        there is no "wait for the next pause" left to take, and splitting the
+        tail would only move the sliver rather than remove it. A tail that
+        happens to land just past a window boundary is therefore still exposed
+        to the stock phrase — one window per dictation at worst, against one
+        per segment before the rule existed.
+        """
+        if not self._frames:
+            return None
+        if self._cut_made and not self._speech:
+            self._reset()
+            return None
+        segment = b"".join(self._frames)
+        self._reset()
+        return segment
+
+
 class Capture:
     """Result of one recording."""
 
@@ -271,11 +434,18 @@ def warm_up(cfg):
     return floor
 
 
-def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None):
+def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None,
+                      on_segment=None):
     """Record until stopped, silent for cfg.silence_duration, or timed out.
 
     `on_first_chunk` fires once, when audio is genuinely flowing, so the UI can
     start its timer from that instant rather than from the keypress.
+
+    `on_segment` fires whenever enough has been recorded to be decoded on its
+    own, cut at a pause — and once more with whatever is left when capture
+    ends. Every byte is still accumulated into `Capture.data` regardless, so
+    the spool keeps writing one WAV per dictation and the crash story is
+    unchanged; the segments are a second, transient view of the same audio.
     """
     dev = resolve_device(cfg.input_device)
     stream = open_stream(cfg, dev)
@@ -290,6 +460,12 @@ def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None)
     silence_secs = cfg.silence_duration
     chunk_seconds = cfg.chunk / float(cfg.rate)
     reason = "stopped"
+    cutter = None
+    if on_segment is not None and cfg.stream_transcription:
+        cutter = SegmentCutter(cfg.rate, cfg.chunk, threshold=threshold,
+                               min_seconds=cfg.segment_min_seconds,
+                               max_seconds=cfg.segment_max_seconds,
+                               cut_silence=cfg.segment_cut_silence)
     try:
         while not stop_event.is_set():
             data = stream.read()
@@ -304,6 +480,12 @@ def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None)
                 peak_rms = rms
             if level_callback:
                 level_callback(rms)
+            if cutter is not None:
+                segment = cutter.feed(data, rms)
+                if segment is not None:
+                    # On the recorder thread, so a slow consumer would stall
+                    # capture. The consumer only queues a job.
+                    on_segment(segment)
             if rms < threshold:
                 if silence_since is None:
                     silence_since = time.time()
@@ -324,6 +506,10 @@ def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None)
                 stream.close()
         except Exception as e:
             log(f"Error closing audio stream: {e}")
+        if cutter is not None:
+            tail = cutter.flush()
+            if tail:
+                on_segment(tail)
 
     duration = time.time() - start
     log(f"Capture: {duration:.1f}s, speech {speech_seconds:.1f}s, "

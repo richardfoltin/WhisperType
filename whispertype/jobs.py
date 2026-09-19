@@ -64,6 +64,92 @@ class TranscriptionJob:
     status: JobStatus = JobStatus.WAITING
     created_at: float = field(default_factory=time.time)
     send_enter: bool = False
+    #: Where the clip is spooled on disk until its transcript is in history.
+    #: The audio used to live only in `audio_bytes`, so anything that killed
+    #: the process between capture and delivery took the recording with it.
+    spool_path: object = None
+    #: The dictation this job is one segment of, when the clip was decoded
+    #: while it was still being recorded. None means the job is the whole
+    #: recording, which is what spool recovery and the benchmark still submit
+    #: — those paths are unchanged by streaming.
+    session: object = None
+    segment_index: int = 0
+
+
+class DictationSession:
+    """The ordered partial transcripts of one dictation.
+
+    A recording decoded while it is still being made arrives as several jobs,
+    and none of the text may be typed until all of them are in — the user
+    asked for the wait to shrink, not for half a sentence to land in their
+    document. This holds the parts, knows when the set is complete, and joins
+    them.
+
+    Locked because the recorder thread registers segments while the worker
+    thread is adding their transcripts.
+    """
+
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.created_at = time.time()
+        #: Total seconds of the whole recording, known only once capture ends.
+        self.audio_duration = 0.0
+        #: The one spooled WAV covering the whole dictation. Dropped when the
+        #: joined transcript is in history, the same rule a single job follows.
+        self.spool_path = None
+        self._parts = {}
+        self._jobs = []
+        self._final_count = None
+        self._cancelled = False
+        self._lock = threading.Lock()
+
+    def register(self, job):
+        with self._lock:
+            self._jobs.append(job)
+
+    def jobs(self):
+        """Every segment submitted so far, so cancelling a dictation can
+        cancel all of them rather than only the one the user clicked."""
+        with self._lock:
+            return list(self._jobs)
+
+    def add(self, index, text):
+        with self._lock:
+            self._parts[index] = text
+
+    def set_final(self, count, duration):
+        """Say how many segments the dictation turned out to have, and how
+        long it was. Called once, when capture has ended and the last segment
+        is queued — until then `complete()` can never be true, which is what
+        stops a half-decoded dictation from being typed."""
+        with self._lock:
+            self._final_count = count
+            self.audio_duration = duration
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+
+    @property
+    def cancelled(self):
+        with self._lock:
+            return self._cancelled
+
+    def complete(self):
+        with self._lock:
+            return (self._final_count is not None
+                    and len(self._parts) >= self._final_count)
+
+    def text(self):
+        with self._lock:
+            parts = [self._parts[i] for i in sorted(self._parts)
+                     if self._parts[i]]
+        return " ".join(parts).strip()
+
+    def progress(self):
+        """(decoded, total-or-None) — what the overlay shows while it runs."""
+        with self._lock:
+            return len(self._parts), self._final_count
 
 
 @dataclass
@@ -164,12 +250,30 @@ class JobQueue:
     # ── Queries ──
 
     def active(self):
+        """One entry per visible unit: a standalone job, or the oldest
+        still-active segment of a dictation.
+
+        The overlay opens a queue table as soon as more than one thing is
+        active, so a five-minute dictation decoded in eight segments would
+        otherwise grow an eight-row panel in the middle of one sentence. The
+        segments stay in `_active` regardless — `busy()` and the shutdown wait
+        read that list, and both must still see every one of them.
+        """
         with self._lock:
-            return list(self._active)
+            out, seen = [], set()
+            for job in self._active:
+                session = getattr(job, "session", None)
+                if session is None:
+                    out.append(job)
+                elif session.session_id not in seen:
+                    seen.add(session.session_id)
+                    out.append(job)
+            return out
 
     def active_count(self):
-        with self._lock:
-            return len(self._active)
+        # Deliberately not `len(self._active)`: this is what the overlay sizes
+        # itself from, so it has to count what the overlay will show.
+        return len(self.active())
 
     def busy(self):
         """True while anything is queued or in flight."""

@@ -90,6 +90,17 @@ TokenIntegrityLevel = 25
 
 _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", wt.LONG), ("top", wt.LONG),
+                ("right", wt.LONG), ("bottom", wt.LONG)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", _RECT),
+                ("rcWork", _RECT), ("dwFlags", wt.DWORD)]
 
 _advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
 _advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
@@ -182,6 +193,7 @@ def _process_integrity(pid=None):
 class WindowsBackend(Backend):
     name = "windows"
     gpu_label = "GPU"
+    event_marker = EVENT_MARKER
 
     def __init__(self):
         self._user32 = ctypes.windll.user32
@@ -390,6 +402,58 @@ class WindowsBackend(Backend):
         _send_inputs(events)
 
     # ── Metrics ──
+
+    def fullscreen_app_running(self):
+        """True while a game (or any full-screen app) owns the screen.
+
+        Two signals, because neither is enough on its own:
+
+          * `SHQueryUserNotificationState` is the API Windows itself uses to
+            decide whether to suppress notifications. Exclusive-fullscreen D3D
+            reports RUNNING_D3D_FULL_SCREEN; Overwatch, measured, reports BUSY.
+          * Borderless-windowed games often report ACCEPTS_NOTIFICATIONS like
+            any other window, so fall back to geometry: a foreground window
+            that covers its entire monitor — *monitor*, not work area, so a
+            merely maximised window does not count.
+
+        False on any error: this only ever decides whether to free memory
+        early, and a wrong "yes" would unload the model under someone who is
+        simply watching a video full screen. That is survivable (it reloads on
+        demand), a wrong "no" is just today's behaviour.
+        """
+        try:
+            state = ctypes.c_int()
+            # QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE
+            if (_shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0
+                    and state.value in (2, 3, 4)):
+                return True
+
+            hwnd = self._user32.GetForegroundWindow()
+            if not hwnd or hwnd in tuple(self._own_windows()):
+                return False
+            name = ctypes.create_unicode_buffer(64)
+            self._user32.GetClassNameW(hwnd, name, 64)
+            if name.value in ("Progman", "WorkerW", "Shell_TrayWnd",
+                              "Windows.UI.Core.CoreWindow"):
+                return False        # the desktop and the shell are not games
+
+            rect = _RECT()
+            if not self._user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return False
+            MONITOR_DEFAULTTONEAREST = 2
+            info = _MONITORINFO()
+            info.cbSize = ctypes.sizeof(_MONITORINFO)
+            monitor = self._user32.MonitorFromWindow(hwnd,
+                                                     MONITOR_DEFAULTTONEAREST)
+            if not self._user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return False
+            screen = info.rcMonitor
+            return (rect.left <= screen.left and rect.top <= screen.top
+                    and rect.right >= screen.right
+                    and rect.bottom >= screen.bottom)
+        except Exception as e:
+            log(f"Full-screen check failed: {e}")
+            return False
 
     def gpu_percent(self):
         if not self._nvml:

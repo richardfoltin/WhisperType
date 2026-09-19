@@ -17,6 +17,11 @@ class Backend:
     #: Human readable, shown in logs only.
     name = "?"
 
+    #: Value stamped into every keystroke this backend synthesises, so the
+    #: global key hook can tell our own typing from the user's and never
+    #: swallow it. None on a backend whose events carry no such field.
+    event_marker = None
+
     #: False when the platform has no usable GPU counter — the overlay then
     #: hides the graph, exactly like the Windows build did without NVML.
     gpu_available = False
@@ -80,6 +85,17 @@ class Backend:
     def gpu_percent(self):
         """Current GPU utilisation 0..100, or None if unavailable."""
         return None
+
+    def fullscreen_app_running(self):
+        """True while something is running full screen — a game, a
+        presentation, a full-screen video.
+
+        A dictation model resident in VRAM is invisible until the machine
+        needs that VRAM for something else; on an 8 GB card, 1.8 GB is the
+        difference between a game fitting and not. Backends that cannot tell
+        return False and nothing changes.
+        """
+        return False
 
     # ── Permissions ──
 

@@ -41,6 +41,26 @@ class ModelInfo:
 _MODEL_ORDER = ["large-v3-turbo", "large-v3", "large-v2",
                 "medium", "small", "base", "tiny"]
 
+#: What openai-whisper downloads into, and the sizes it reports.
+WHISPER_CACHE = Path.home() / ".cache" / "whisper"
+WHISPER_SIZES = {
+    "large-v3-turbo": "809 MB", "large-v3": "1.5 GB", "large-v2": "1.5 GB",
+    "medium": "769 MB", "small": "244 MB", "base": "74 MB", "tiny": "39 MB",
+}
+
+
+#: Module functions rather than engine methods because the tray asks these
+#: questions from the UI thread, and once the engine lives in another process
+#: the answer must not depend on that process being alive or idle. Both are
+#: pure filesystem checks, so nothing is lost by answering locally.
+def local_is_downloaded(name):
+    return (WHISPER_CACHE / f"{name}.pt").exists()
+
+
+def local_catalog():
+    return [ModelInfo(n, WHISPER_SIZES[n], local_is_downloaded(n))
+            for n in _MODEL_ORDER]
+
 
 def pcm_to_float32(audio_bytes):
     """Raw 16-bit PCM -> float32 in [-1, 1]. Bypasses ffmpeg entirely."""
@@ -130,10 +150,7 @@ def report_prompt_budget(language):
 class WhisperEngine:
     """openai-whisper + torch (CUDA when present)."""
 
-    SIZES = {
-        "large-v3-turbo": "809 MB", "large-v3": "1.5 GB", "large-v2": "1.5 GB",
-        "medium": "769 MB", "small": "244 MB", "base": "74 MB", "tiny": "39 MB",
-    }
+    SIZES = WHISPER_SIZES
 
     def __init__(self):
         import torch
@@ -142,10 +159,13 @@ class WhisperEngine:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self._model = None
         self._name = None
-        self._cache = Path.home() / ".cache" / "whisper"
+        self._bench_model = None
+        self._cache = WHISPER_CACHE
         #: Overridable via the "fp16" config key — App sets it after
         #: construction. Half precision is right on Turing and newer, but
-        #: Pascal (sm_61) runs fp16 math at 1/64 rate, where fp32 can win.
+        #: Pascal (sm_61) runs fp16 math at 1/64 rate, where fp32 wins. The
+        #: default now follows the hardware instead of only warning about it:
+        #: a note in a log file nobody reads is not a default.
         self.fp16 = self.device == "cuda"
         log(f"Torch device: {self.device}")
         if self.device == "cuda":
@@ -154,8 +174,10 @@ class WhisperEngine:
                 log(f"GPU: {p.name} (sm_{p.major}{p.minor}, "
                     f"{p.total_memory / 1024 ** 3:.1f} GB)")
                 if p.major < 7:
-                    log(f'Note: sm_{p.major}{p.minor} has no tensor cores. '
-                        f'Try "fp16": false in config.json and compare.')
+                    self.fp16 = False
+                    log(f"sm_{p.major}{p.minor} has no tensor cores and runs "
+                        f"fp16 at 1/64 rate — defaulting to fp32. Override "
+                        f'with "fp16": true in config.json.')
             except Exception:
                 pass
 
@@ -164,11 +186,10 @@ class WhisperEngine:
         return self.device.upper()
 
     def catalog(self):
-        return [ModelInfo(n, self.SIZES[n], (self._cache / f"{n}.pt").exists())
-                for n in _MODEL_ORDER]
+        return local_catalog()
 
     def is_downloaded(self, name):
-        return (self._cache / f"{name}.pt").exists()
+        return local_is_downloaded(name)
 
     def load(self, name):
         log(f"Loading {name} on {self.device}...")
@@ -188,17 +209,30 @@ class WhisperEngine:
 
         Deliberately not stored in self._model: the benchmark must not leave a
         different model installed as the dictation model if it is interrupted.
+
+        Returns a *handle* (the name) rather than the model object, so the same
+        call still works once the engine runs in another process, where a torch
+        module cannot cross the boundary. See engine_proc.
         """
         t0 = time.perf_counter()
-        model = self._whisper.load_model(name, device=self.device)
-        return model, time.perf_counter() - t0
+        self._bench_model = self._whisper.load_model(name, device=self.device)
+        return name, time.perf_counter() - t0
 
-    def transcribe_with(self, model, audio_bytes, language):
-        """Transcribe on an explicitly supplied model (benchmark path).
+    def release_benchmark_model(self):
+        """Drop the benchmark model. Called in a finally, so it also runs when
+        the load or the decode raised and left one partially pinned."""
+        self._bench_model = None
+        self.free_cache()
+
+    def transcribe_with(self, handle, audio_bytes, language):
+        """Transcribe on the model load_for_benchmark put in place.
 
         Uses the same decode options as transcribe(), so what the benchmark
         measures is the decode the user actually dictates with.
         """
+        model = self._bench_model
+        if model is None:
+            raise RuntimeError(f"no benchmark model is loaded for {handle}")
         audio_np = pcm_to_float32(audio_bytes)
         result = self._whisper.transcribe(model, audio_np,
                                           language=language,
@@ -496,7 +530,10 @@ class OpenAiEngine:
     # ── Benchmark hooks ──
 
     def load_for_benchmark(self, name):
-        return name, 0.0         # no load step; the "model" is just its name
+        return name, 0.0         # no load step; the handle is just its name
+
+    def release_benchmark_model(self):
+        pass                     # nothing was ever resident
 
     def transcribe_with(self, model, audio_bytes, language):
         return self._post(model, audio_bytes, language)
@@ -596,4 +633,32 @@ def create_engine(cfg=None):
     """Local GPU engine, or the hosted API when the config asks for it."""
     if cfg is not None and cfg.stt_engine == "openai":
         return OpenAiEngine(cfg)
-    return MlxEngine() if IS_MAC else WhisperEngine()
+    if IS_MAC:
+        return MlxEngine()
+    return _cuda_engine(cfg)
+
+
+def _cuda_engine(cfg):
+    """The CUDA engine, in a process of its own.
+
+    A native fault inside the NVIDIA driver kills whichever process it happens
+    in, and no Python-level handling can intervene — so the decoder does not
+    share this one. `"isolate_decoder": false` puts it back in-process, which
+    is useful under a debugger and is what happens anyway if the child cannot
+    be started.
+
+    macOS is deliberately not covered: MLX has not shown this failure, and its
+    thread-affinity rules make the in-process path the tested one there.
+    """
+    if cfg is not None and not cfg.get("isolate_decoder", True):
+        log("Decoder isolation is off — a driver crash will take the daemon "
+            "down with it")
+        return WhisperEngine()
+    from .engine_proc import RemoteWhisperEngine
+    try:
+        return RemoteWhisperEngine()
+    except Exception as e:
+        log(f"Could not start the decoder process ({e}) — decoding in this "
+            f"process instead. A driver crash will take the daemon with it "
+            f"again, though the spooled audio still survives one.")
+        return WhisperEngine()

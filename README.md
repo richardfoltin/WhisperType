@@ -75,7 +75,7 @@ To remove everything it created:
 | Switch model | Tray / menu bar ▸ Model |
 | Exit | Tray / menu bar ▸ Exit |
 
-Esc is the only key WhisperType watches besides the hotkey, and only while the overlay is on screen. History used to be on Space; it is a menu item now, because watching a key you press constantly — globally, for as long as the overlay happened to be up — was never a good trade.
+Enter and Esc are the only keys WhisperType watches besides the hotkey, and while a recording is running it swallows them: the app you are dictating into never sees the Enter that ended the dictation — the transcript gets its own Enter after it has been typed. Outside a recording both keys go straight through to whatever is focused (Esc additionally hides the overlay, if it is up). History used to be on Space; it is a menu item now, because watching a key you press constantly — globally, for as long as the overlay happened to be up — was never a good trade.
 
 1. Double-tap **Right Ctrl** to start recording — a floating overlay appears
 2. Speak naturally
@@ -322,9 +322,10 @@ The submenus remain for a quick one-off change. Everything below can also be edi
 | `max_recording_time` | `300.0` | Maximum recording length in seconds |
 | `sample_rate` | `16000` | Capture rate. Whisper expects 16 kHz — leave it alone |
 | `chunk_size` | `1024` | Frames per read |
-| `fp16` | `true` on GPU | Half-precision inference (Windows/CUDA). Forced off on CPU |
+| `fp16` | `true` on Turing+, `false` on Pascal | Half-precision inference (Windows/CUDA). Forced off on CPU, and defaulted off on pre-Turing cards (`sm_6x` and below), which run fp16 at 1/64 rate |
 | `min_speech_seconds` | `0.25` | A clip with less speech than this is discarded instead of transcribed. Whisper reliably invents a sentence for silence, and an accidental double-tap would otherwise type it into your document. |
 | `idle_unload_minutes` | `10` | Release the model after this many idle minutes (`0` = keep it resident). Measured: 1799 MB → 260 MB, and reloading from the local cache takes about a second. |
+| `isolate_decoder` | `true` | Run the CUDA decoder in a process of its own, so a native fault in the NVIDIA driver kills only the decoder and the clip is retried instead of lost. Set `false` to decode in-process — useful under a debugger. Ignored on macOS. |
 | `theme` | `"auto"` | Overlay appearance: `auto` follows the system light/dark setting (re-read every time the overlay appears), or pin it with `dark` / `light`. On Windows the accent colour is taken from Windows too, and corrected until it is legible on the panel. |
 | `show_gpu_graph` | `false` | Draw the 60-second utilisation graph on the overlay. Off because it sits above "am I recording?"; the number still shows as a chip while transcribing. |
 | `stt_engine` | `"local"` | `local` runs Whisper here; `openai` uses the hosted API (see above) |
@@ -345,7 +346,12 @@ Capture: 7.2s, speech 4.1s, peak RMS 4820 (threshold 200), ended by silence
 
 Microphones with aggressive noise suppression output *exact* digital zero between words, so a pause has no room tone to keep the counter from advancing — the startup log prints the idle noise floor so you can see whether that is your situation. If the peak never exceeds the threshold at all, the log says so too, and the cause is the wrong `input_device` or a `silence_threshold` set above your voice.
 
-**About `fp16`:** half precision is the right default on Turing and newer (RTX 20xx+). Pascal cards (GTX 10xx, `sm_61`) run fp16 math at 1/64 rate, so fp32 can be faster there. The log prints your GPU's compute capability at startup.
+**About `fp16`:** half precision is the right default on Turing and newer (RTX 20xx+). Pascal cards (GTX 10xx, `sm_61`) run fp16 math at 1/64 rate, so fp32 is faster there — which is why the default now follows the card's compute capability rather than just warning about it in the log. Set `"fp16": true` to override. The log prints your GPU's compute capability at startup.
+
+**If a recording is never lost again, this is why.** A clip used to exist only in RAM between the moment capture ended and the moment its transcript reached history. On 2026-08-18 a fast-fail inside `nvcuda64.dll` (`0xc0000409`, stack-cookie check) killed the daemon in exactly that window and took 141 seconds of dictation with it — a native fast-fail is the OS terminating the process on the spot, so no `except`, no `finally` and no atexit handler ever ran. Two things changed:
+
+* Every clip is written to `~/.whispertype/spool/` as a plain WAV *before* it is queued, and deleted once its transcript is in history. Anything still there at startup is re-transcribed into history — never typed, because the window it was dictated into is long gone. A clip that fails twice is left on disk and named in the log rather than retried forever.
+* The CUDA decoder runs in its own process. When it dies the daemon notices, restarts it and retries the clip from memory; the spooled WAV covers the case where even that fails.
 
 If `config.json` is missing it is created from the defaults. If it exists but cannot be parsed, WhisperType runs on defaults and **leaves your file alone** — one stray comma must not cost you your settings, so nothing writes over a config it could not read.
 

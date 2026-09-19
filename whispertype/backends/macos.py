@@ -85,6 +85,7 @@ def _utf16_chunks(text, limit=20):
 class MacBackend(Backend):
     name = "macos"
     gpu_label = "GPU"
+    event_marker = EVENT_MARKER
 
     def __init__(self, own_pid=None):
         import os
