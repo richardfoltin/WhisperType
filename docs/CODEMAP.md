@@ -12,17 +12,17 @@ that file.
 - setup_mac.py:
   - `APP = ["main.py"]`
   - `OPTIONS = …`
-- files: CLAUDE.md, LICENSE, README.md, SPEC.md, config.template.json, initial_prompt.md, install.bat, install_mac.sh, main.py, requirements-mac.txt, requirements.txt, start.bat, start_debug.bat, start_silent.vbs, uninstall_mac.sh, whispertype.pyw
+- files: CLAUDE.md, FOLDERS.md, LICENSE, README.md, SPEC.md, config.template.json, initial_prompt.md, install.bat, install_mac.sh, main.py, requirements-mac.txt, requirements.txt, start.bat, start_debug.bat, start_silent.vbs, uninstall_mac.sh, whispertype.pyw
 
 ## whispertype
 
-- log.py — imported by 9 files:
+- log.py — imported by 10 files:
   - `def log(msg):`
   - `LOG_PATH = …`
   - `MAX_BYTES = 1_000_000`
   - `def init(redirect_std=True):`
   - `def close():`
-- __init__.py — imported by 5 files:
+- __init__.py — imported by 6 files:
   - `def main():`
 - config.py — imported by 3 files:
   - `API_KEY_PATH = CONFIG_DIR / "openai_api_key"`
@@ -69,7 +69,10 @@ that file.
 - audio.py:
   - `IS_MAC = sys.platform == "darwin"`
   - `def backend():`
+  - `def reset_device_cache():`
   - `def resolve_device(spec):`
+  - `def open_stream(cfg, device):`
+  - `def list_input_devices():`
   - `class Capture:`
   - `def warm_up(cfg):`
   - `def record_until_stop(cfg, stop_event, level_callback=None, on_first_chunk=None):`
@@ -99,12 +102,14 @@ that file.
   - `KEYEVENTF_KEYUP = 0x0002`
   - `VK_MENU = 0x12`
   - `VK_RETURN = 0x0D`
+  - `EVENT_MARKER = 0x57485459`
   - `class MOUSEINPUT(ctypes.Structure):`
   - `class KEYBDINPUT(ctypes.Structure):`
   - `class HARDWAREINPUT(ctypes.Structure):`
   - `class INPUT(ctypes.Structure):`
   - `TYPE_CHUNK_CHARS = 200`
-  - `class WindowsBackend(Backend):`
+  - `PROCESS_QUERY_LIMITED_INFORMATION = 0x1000`
+  - … +3 more exports
 
 ## whispertype/ui
 
@@ -112,7 +117,7 @@ that file.
   - `LANGUAGES = …`
   - `IDLE_CHOICES = …`
   - `ENGINES = …`
-- __init__.py:
+- __init__.py — imported by 1 file:
   - `def create_ui_factory():`
 - appkit_ui.py:
   - `OV_W = 380`
@@ -124,12 +129,38 @@ that file.
   - `class OverlayWebView(WKWebView):`
   - `class Bridge(NSObject):`
   - `class AppKitUI:`
+- theme.py:
+  - `IS_WINDOWS = sys.platform == "win32"`
+  - `DARK = …`
+  - `LIGHT = …`
+  - `def contrast(a, b):`
+  - `def mix(a, b, t):`
+  - `def readable(colour, on, ratio=3.0):`
+  - `def system_is_dark():`
+  - `def system_accent():`
+  - `def resolve(theme):`
 - tk_ui.py:
   - `OFF_SCREEN = "-9999+-9999"`
   - `OV_W = 380`
+  - `OV_H_COMPACT = 224`
+  - `OV_H_QUEUE = 312`
+  - `OV_H_HISTORY = 484`
+  - `GPU_GRAPH_H = 56`
   - `MAX_QUEUE_VISIBLE = 5`
-  - `VISIBLE_HISTORY = 8`
   - `HISTORY_ITEM_H = 22`
+  - `TICKER_SECONDS = 0.7`
+  - `CLAMP_CHARS = 190`
   - `class TkUI:`
+- winicon.py:
+  - `DIB_RGB_COLORS = 0`
+  - `BI_RGB = 0`
+  - `SHGFI_ICON = 0x000000100`
+  - `SHGFI_LARGEICON = 0x000000000`
+  - `class ICONINFO(ctypes.Structure):`
+  - `class BITMAP(ctypes.Structure):`
+  - `class BITMAPINFOHEADER(ctypes.Structure):`
+  - `class BITMAPINFO(ctypes.Structure):`
+  - `class SHFILEINFOW(ctypes.Structure):`
+  - `def photo(path, size=16, master=None):`
 - files: overlay.html
-_(1 of 93 exported symbols not detailed — every file is still named above or counted in a `dir/` line)_
+_(4 of 124 exported symbols not detailed — every file is still named above or counted in a `dir/` line)_
