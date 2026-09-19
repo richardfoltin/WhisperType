@@ -194,9 +194,53 @@ class WhisperEngine:
     def load(self, name):
         log(f"Loading {name} on {self.device}...")
         t0 = time.perf_counter()
-        self._model = self._whisper.load_model(name, device=self.device)
+        self._model = self._build(name)
         self._name = name
         log(f"{name} ready on {self.device} ({time.perf_counter() - t0:.1f}s).")
+
+    def _build(self, name):
+        """whisper.load_model(name, "cuda"), without its detours through host
+        memory.
+
+        load_model puts the fp16 checkpoint on the GPU, builds an fp32 model on
+        the CPU, copies the checkpoint into it and only then moves the model to
+        the GPU. Every one of those copies is charged to the Windows commit
+        limit — VRAM included: the 3.2 GB of fp32 weights on the card show up
+        as 3.2 GB of this process's commit. Here the checkpoint is memory-mapped
+        on the CPU and the model is built directly on the GPU. Measured on the
+        GTX 1070 Ti with large-v3-turbo, through this engine, on a 101-second
+        dictation that decoded to the identical transcript both ways:
+
+                          peak commit   commit once loaded   load time
+            load_model      10150 MB         10042 MB          6.4 s
+            this             6549 MB          4947 MB          3.7 s
+
+        After the first decode both settle at about 5.2 GB — free_cache drops
+        what load_model left behind — so the saving is the load, and the
+        stretch between it and the first dictation. The load is what failed. Every "CUDA out of memory" with gigabytes
+        still free on the card, and every ACCESS_VIOLATION in the middle of a
+        load, on 2026-09-11, 09-18 and 09-19, landed within seconds of a
+        Windows low-virtual-memory event, with the machine's commit charge at
+        99.8% of its limit. Built this way the model needs 3.5 GB less of it.
+        """
+        w = self._whisper
+        url = getattr(w, "_MODELS", {}).get(name)
+        heads = getattr(w, "_ALIGNMENT_HEADS", {}).get(name)
+        if self.device != "cuda" or url is None or heads is None:
+            return w.load_model(name, device=self.device)
+        import torch
+        from whisper.model import ModelDimensions, Whisper
+        # The same download and SHA-256 check load_model runs.
+        path = w._download(url, str(WHISPER_CACHE), False)
+        ckpt = torch.load(path, map_location="cpu", mmap=True,
+                          weights_only=True)
+        with torch.device(self.device):
+            model = Whisper(ModelDimensions(**ckpt["dims"]))
+        model.load_state_dict(ckpt["model_state_dict"])
+        del ckpt
+        model.set_alignment_heads(heads)
+        # The alignment-heads buffer is built on the CPU; this moves it.
+        return model.to(self.device)
 
     def predownload(self, name):
         """Fetch a model into the cache without touching the GPU."""
@@ -215,7 +259,7 @@ class WhisperEngine:
         module cannot cross the boundary. See engine_proc.
         """
         t0 = time.perf_counter()
-        self._bench_model = self._whisper.load_model(name, device=self.device)
+        self._bench_model = self._build(name)
         return name, time.perf_counter() - t0
 
     def release_benchmark_model(self):
