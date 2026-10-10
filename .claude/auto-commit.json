@@ -1,0 +1,27 @@
+{
+  "name": "whispertype",
+  "language": "en",
+  "description": "WhisperType, push-to-talk voice dictation for Windows and macOS: Whisper runs on the local GPU and the text lands in the app in focus; the Python package under whispertype/ (the app, audio capture, the transcription engine process with its spool and jobs, the per-OS backends, the Tk and AppKit UI with its overlay), main.py, the installers (install.bat, install_mac.sh).",
+  "glossary": {
+    "engine": "whispertype/transcribe.py, engine_proc.py, jobs.py, spool.py (the transcription engine and its queue)",
+    "audio": "whispertype/audio.py",
+    "backends": "whispertype/backends (the per-OS backends)",
+    "ui": "whispertype/ui (Tk, AppKit, the overlay)",
+    "app": "the rest of whispertype/ and main.py",
+    "install": "install.bat, install_mac.sh, requirements*.txt, config.template.json",
+    "docs": "docs/ and the root's documents",
+    "tooling": ".claude, .gitignore, .gitattributes"
+  },
+  "areas": [
+    {"pattern": "^whispertype/(?:transcribe|engine_proc|jobs|spool)\\.py$", "area": "engine"},
+    {"pattern": "^whispertype/audio\\.py$", "area": "audio"},
+    {"pattern": "^whispertype/backends/", "area": "backends"},
+    {"pattern": "^whispertype/ui/", "area": "ui"},
+    {"pattern": "^whispertype/|^main\\.py$", "area": "app"},
+    {"pattern": "^(?:install\\.bat|install_mac\\.sh|requirements[^/]*\\.txt|config\\.template\\.json)$", "area": "install"},
+    {"pattern": "^docs/|^[^/]+\\.md$", "area": "docs"},
+    {"pattern": "^(?:\\.claude/|\\.git(?:ignore|attributes)$)", "area": "tooling"},
+    {"pattern": "^\\.?([^/]+)/", "area": "{1}"},
+    {"pattern": "^[^/]+$", "area": "root"}
+  ]
+}
